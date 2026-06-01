@@ -1,0 +1,538 @@
+import sys
+sys.path.append("/user/pydeps")
+
+import csv
+import math
+import random
+import statistics
+from dataclasses import dataclass
+
+try:
+    import simpy
+except ModuleNotFoundError:
+    raise ModuleNotFoundError(
+        "Не найдена библиотека simpy. Установи её командой: "
+        "python -m pip install simpy --target=/user/pydeps"
+    )
+
+try:
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:
+    plt = None
+
+
+# ПАРАМЕТРЫ МОДЕЛИ
+
+@dataclass
+class ModelParams:
+    # Репликации
+    n_replications: int = 30
+    simulation_time: float = 120.0
+
+    # Потоки пакетов
+    lambda_user: float = 20.0       # интенсивность легитимного потока, пак/сек
+    attack_rate: float = 250.0      # интенсивность атакующего потока f, пак/сек
+
+    # Обслуживание точки доступа
+    mu_ap: float = 120.0            # интенсивность обработки пакетов точкой доступа, пак/сек
+
+    # Буфер точки доступа
+    buffer_capacity: int = 8000     # размер буфера точки доступа, пакетов
+
+    # Условие фиксации отказа
+    fail_queue_level: float = 0.98  # отказ фиксируется при заполнении 98% буфера
+
+    # Случайность
+    seed: int = 42
+
+
+# МОДЕЛЬ DOS-АТАКИ НА ТОЧКУ ДОСТУПА
+
+class WLANAccessPointDoSModel:
+    def __init__(self, env: simpy.Environment, params: ModelParams, seed: int):
+        self.env = env
+        self.p = params
+        self.rng = random.Random(seed)
+
+        # Очередь пакетов в буфере точки доступа
+        self.queue = []
+
+        # Состояние точки доступа
+        self.server_busy = False
+        self.failed = False
+        self.fail_time = None
+
+        # Статистика поступивших пакетов
+        self.arrived_total = 0
+        self.arrived_user = 0
+        self.arrived_attack = 0
+
+        # Статистика принятых пакетов
+        self.accepted_total = 0
+        self.accepted_user = 0
+        self.accepted_attack = 0
+
+        # Статистика обработанных пакетов
+        self.processed_total = 0
+        self.processed_user = 0
+        self.processed_attack = 0
+
+        # Статистика потерянных пакетов
+        self.lost_total = 0
+        self.lost_user = 0
+        self.lost_attack = 0
+
+        # Временные характеристики
+        self.wait_times = []
+        self.system_times = []
+
+        # Для оценки средней длины очереди во времени
+        self.last_queue_change_time = env.now
+        self.queue_area = 0.0
+        self.max_queue_length = 0
+
+    # Случайные величины
+
+    def exp_time(self, rate: float) -> float:
+        """
+        Генерация случайного времени по экспоненциальному распределению.
+        rate — интенсивность, событий/сек.
+        """
+        if rate <= 0:
+            return math.inf
+        return self.rng.expovariate(rate)
+
+    # Учёт средней длины очереди
+
+    def update_queue_area(self):
+        now = self.env.now
+        dt = now - self.last_queue_change_time
+
+        if dt > 0:
+            self.queue_area += len(self.queue) * dt
+            self.last_queue_change_time = now
+
+    def set_queue_changed(self):
+        self.update_queue_area()
+        self.max_queue_length = max(self.max_queue_length, len(self.queue))
+
+    # Источники трафика
+
+    def user_source(self):
+        """
+        Источник легитимного пользовательского трафика.
+        """
+        while self.env.now < self.p.simulation_time:
+            yield self.env.timeout(self.exp_time(self.p.lambda_user))
+            self.handle_arrival(packet_type="user")
+
+    def attack_source(self):
+        """
+        Источник атакующего трафика.
+        """
+        while self.env.now < self.p.simulation_time:
+            yield self.env.timeout(self.exp_time(self.p.attack_rate))
+            self.handle_arrival(packet_type="attack")
+
+    # Поступление пакета
+
+    def handle_arrival(self, packet_type: str):
+        """
+        Обработка поступления нового пакета.
+
+        ВАЖНО:
+        После отказа точки доступа все новые пакеты считаются потерянными,
+        потому что AP больше не может их принимать и обслуживать.
+        """
+
+        # Любой пакет сначала считается поступившим в систему
+        self.arrived_total += 1
+
+        if packet_type == "user":
+            self.arrived_user += 1
+        else:
+            self.arrived_attack += 1
+
+        # Если точка доступа уже отказала,
+        # то все новые пакеты считаются потерянными
+        if self.failed:
+            self.lost_total += 1
+
+            if packet_type == "user":
+                self.lost_user += 1
+            else:
+                self.lost_attack += 1
+
+            return
+
+        packet = {
+            "type": packet_type,
+            "arrival_time": self.env.now
+        }
+
+        # Если сервер свободен и очередь пустая — пакет сразу идёт на обработку
+        if not self.server_busy and len(self.queue) == 0:
+            self.accept_packet(packet)
+            self.env.process(self.service_packet(packet))
+            return
+
+        # Если сервер занят — пытаемся поставить пакет в буфер
+        if len(self.queue) < self.p.buffer_capacity:
+            self.set_queue_changed()
+            self.queue.append(packet)
+            self.set_queue_changed()
+            self.accept_packet(packet)
+
+            # Если буфер достиг критического уровня,
+            # фиксируем отказ точки доступа
+            if len(self.queue) >= int(self.p.buffer_capacity * self.p.fail_queue_level):
+                self.failed = True
+                self.fail_time = self.env.now
+
+            return
+
+        # Если буфер полностью переполнен — пакет теряется
+        self.lost_total += 1
+
+        if packet_type == "user":
+            self.lost_user += 1
+        else:
+            self.lost_attack += 1
+
+        # Переполнение буфера также фиксируем как отказ
+        if self.fail_time is None:
+            self.failed = True
+            self.fail_time = self.env.now
+
+    def accept_packet(self, packet: dict):
+        """
+        Учёт принятого пакета.
+        """
+        self.accepted_total += 1
+
+        if packet["type"] == "user":
+            self.accepted_user += 1
+        else:
+            self.accepted_attack += 1
+
+    # Обслуживание пакета
+
+    def service_packet(self, packet: dict):
+        """
+        Обработка одного пакета точкой доступа.
+        """
+        self.server_busy = True
+
+        wait_time = self.env.now - packet["arrival_time"]
+        self.wait_times.append(wait_time)
+
+        service_time = self.exp_time(self.p.mu_ap)
+        yield self.env.timeout(service_time)
+
+        system_time = self.env.now - packet["arrival_time"]
+        self.system_times.append(system_time)
+
+        self.processed_total += 1
+
+        if packet["type"] == "user":
+            self.processed_user += 1
+        else:
+            self.processed_attack += 1
+
+        self.server_busy = False
+
+        # После завершения обслуживания берём следующий пакет из очереди.
+        # Если точка доступа уже отказала, обслуживание новых пакетов не начинается.
+        if self.queue and not self.failed:
+            self.set_queue_changed()
+            next_packet = self.queue.pop(0)
+            self.set_queue_changed()
+            self.env.process(self.service_packet(next_packet))
+
+    # Итоги одной репликации
+
+    def results(self) -> dict:
+        self.update_queue_area()
+
+        total_arrived = self.arrived_total if self.arrived_total > 0 else 1
+        user_arrived = self.arrived_user if self.arrived_user > 0 else 1
+        attack_arrived = self.arrived_attack if self.arrived_attack > 0 else 1
+
+        mean_queue = self.queue_area / self.p.simulation_time
+        mean_wait = statistics.mean(self.wait_times) if self.wait_times else 0.0
+        mean_system = statistics.mean(self.system_times) if self.system_times else 0.0
+
+        if self.fail_time is None:
+            t_work = self.p.simulation_time
+        else:
+            t_work = self.fail_time
+
+        return {
+            "attack_rate": self.p.attack_rate,
+            "rho": (self.p.lambda_user + self.p.attack_rate) / self.p.mu_ap,
+
+            "arrived_total": self.arrived_total,
+            "arrived_user": self.arrived_user,
+            "arrived_attack": self.arrived_attack,
+
+            "accepted_total": self.accepted_total,
+            "accepted_user": self.accepted_user,
+            "accepted_attack": self.accepted_attack,
+
+            "processed_total": self.processed_total,
+            "processed_user": self.processed_user,
+            "processed_attack": self.processed_attack,
+
+            "lost_total": self.lost_total,
+            "lost_user": self.lost_user,
+            "lost_attack": self.lost_attack,
+
+            "loss_probability_total": self.lost_total / total_arrived,
+            "loss_probability_user": self.lost_user / user_arrived,
+            "loss_probability_attack": self.lost_attack / attack_arrived,
+
+            "mean_queue": mean_queue,
+            "max_queue": self.max_queue_length,
+            "mean_wait": mean_wait,
+            "mean_system": mean_system,
+
+            "t_work": t_work,
+            "packets_to_fail": self.arrived_total if self.failed else self.arrived_total,
+            "failed": 1 if self.failed else 0
+        }
+
+
+# ЗАПУСК РЕПЛИКАЦИЙ
+
+def run_one_replication(params: ModelParams, seed: int) -> dict:
+    env = simpy.Environment()
+    model = WLANAccessPointDoSModel(env, params, seed)
+
+    env.process(model.user_source())
+    env.process(model.attack_source())
+
+    env.run(until=params.simulation_time)
+
+    return model.results()
+
+
+def average_results(results: list[dict]) -> dict:
+    keys = results[0].keys()
+    avg = {}
+
+    for key in keys:
+        if isinstance(results[0][key], (int, float)):
+            avg[key] = statistics.mean(r[key] for r in results)
+
+    return avg
+
+
+def run_replications(params: ModelParams) -> tuple[dict, list[dict]]:
+    all_results = []
+
+    for i in range(params.n_replications):
+        result = run_one_replication(params, seed=params.seed + i)
+        all_results.append(result)
+
+    avg = average_results(all_results)
+    avg["n_replications"] = params.n_replications
+    avg["simulation_time"] = params.simulation_time
+    avg["lambda_user"] = params.lambda_user
+    avg["mu_ap"] = params.mu_ap
+    avg["buffer_capacity"] = params.buffer_capacity
+
+    return avg, all_results
+
+
+# СЕРИЯ ЭКСПЕРИМЕНТОВ ПО ИНТЕНСИВНОСТИ АТАКИ
+
+def run_attack_experiments():
+    attack_rates = [250, 500, 750, 1000, 1500, 2000, 3500, 5000]
+
+    base_params = ModelParams(
+        n_replications=30,
+        simulation_time=120.0,
+
+        lambda_user=20.0,
+        attack_rate=250.0,
+        mu_ap=120.0,
+
+        buffer_capacity=8000,
+        fail_queue_level=0.98,
+
+        seed=42
+    )
+
+    summary_rows = []
+
+    for idx, attack_rate in enumerate(attack_rates):
+        params = ModelParams(**base_params.__dict__)
+        params.attack_rate = attack_rate
+        params.seed = base_params.seed + idx * 100
+
+        avg, _ = run_replications(params)
+        summary_rows.append(avg)
+
+    return summary_rows
+
+
+# СОХРАНЕНИЕ CSV
+
+def save_results_to_csv(rows: list[dict], filename="/user/wlan_dos_results.csv"):
+    fieldnames = [
+        "attack_rate",
+        "rho",
+
+        "arrived_total",
+        "arrived_user",
+        "arrived_attack",
+
+        "accepted_total",
+        "accepted_user",
+        "accepted_attack",
+
+        "processed_total",
+        "processed_user",
+        "processed_attack",
+
+        "lost_total",
+        "lost_user",
+        "lost_attack",
+
+        "loss_probability_total",
+        "loss_probability_user",
+        "loss_probability_attack",
+
+        "mean_queue",
+        "max_queue",
+        "mean_wait",
+        "mean_system",
+
+        "t_work",
+        "packets_to_fail",
+        "failed",
+
+        "n_replications",
+        "simulation_time",
+        "lambda_user",
+        "mu_ap",
+        "buffer_capacity"
+    ]
+
+    with open(filename, "w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for row in rows:
+            writer.writerow(row)
+
+
+# ПОСТРОЕНИЕ ГРАФИКОВ ЧЕРЕЗ MATPLOTLIB
+
+def make_plots(rows: list[dict]):
+    if plt is None:
+        print("matplotlib не установлен, графики не построены.")
+        return
+
+    attack = [r["attack_rate"] for r in rows]
+    t_work = [r["t_work"] for r in rows]
+    loss_total = [r["loss_probability_total"] * 100 for r in rows]
+    loss_user = [r["loss_probability_user"] * 100 for r in rows]
+    queue = [r["mean_queue"] for r in rows]
+    packets_to_fail = [r["packets_to_fail"] for r in rows]
+
+    # 1. Время стабильной работы точки доступа
+    plt.figure(figsize=(8, 5))
+    plt.plot(attack, t_work, marker="o")
+    plt.xlabel("Интенсивность атаки f, пак/сек")
+    plt.ylabel("Время стабильной работы AP, сек")
+    plt.title("Влияние интенсивности атаки на время работы точки доступа")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("/user/plot_twork_vs_attack.png", dpi=200)
+    plt.close()
+
+    # 2. Общая вероятность потерь
+    plt.figure(figsize=(8, 5))
+    plt.plot(attack, loss_total, marker="o")
+    plt.xlabel("Интенсивность атаки f, пак/сек")
+    plt.ylabel("Потери, %")
+    plt.title("Общая вероятность потерь при DoS-атаке")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("/user/plot_loss_vs_attack.png", dpi=200)
+    plt.close()
+
+    # 3. Вероятность потерь пользовательских пакетов
+    plt.figure(figsize=(8, 5))
+    plt.plot(attack, loss_user, marker="o")
+    plt.xlabel("Интенсивность атаки f, пак/сек")
+    plt.ylabel("Потери пользовательских пакетов, %")
+    plt.title("Потери легитимного трафика при DoS-атаке")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("/user/plot_user_loss_vs_attack.png", dpi=200)
+    plt.close()
+
+    # 4. Средняя длина очереди
+    plt.figure(figsize=(8, 5))
+    plt.plot(attack, queue, marker="o")
+    plt.xlabel("Интенсивность атаки f, пак/сек")
+    plt.ylabel("Средняя длина очереди, пакетов")
+    plt.title("Влияние интенсивности атаки на среднюю длину очереди")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("/user/plot_queue_vs_attack.png", dpi=200)
+    plt.close()
+
+    # 5. Число пакетов до отказа
+    plt.figure(figsize=(8, 5))
+    plt.plot(attack, packets_to_fail, marker="o")
+    plt.xlabel("Интенсивность атаки f, пак/сек")
+    plt.ylabel("Число пакетов до отказа")
+    plt.title("Число пакетов, нарушивших работу точки доступа")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("/user/plot_packets_to_fail.png", dpi=200)
+    plt.close()
+
+
+# ПЕЧАТЬ РЕЗУЛЬТАТОВ
+
+def print_table(rows: list[dict]):
+    print("\n===== РЕЗУЛЬТАТЫ МОДЕЛИРОВАНИЯ DOS-АТАКИ НА ТОЧКУ ДОСТУПА =====")
+    print(
+        "f, пак/сек | rho  | Twork, сек | Потери общ., % | Потери user, % | "
+        "Ср. очередь | Ср. ожидание | Пакетов до отказа"
+    )
+    print("-" * 125)
+
+    for r in rows:
+        print(
+            f"{r['attack_rate']:10.0f} | "
+            f"{r['rho']:4.2f} | "
+            f"{r['t_work']:10.2f} | "
+            f"{r['loss_probability_total'] * 100:14.2f} | "
+            f"{r['loss_probability_user'] * 100:14.2f} | "
+            f"{r['mean_queue']:11.2f} | "
+            f"{r['mean_wait']:11.4f} | "
+            f"{r['packets_to_fail']:16.2f}"
+        )
+
+    print("-" * 125)
+    print("CSV сохранён: /user/wlan_dos_results.csv")
+    print("Графики сохранены:")
+    print("/user/plot_twork_vs_attack.png")
+    print("/user/plot_loss_vs_attack.png")
+    print("/user/plot_user_loss_vs_attack.png")
+    print("/user/plot_queue_vs_attack.png")
+    print("/user/plot_packets_to_fail.png")
+
+
+# ОСНОВНОЙ ЗАПУСК
+
+if __name__ == "__main__":
+    rows = run_attack_experiments()
+    save_results_to_csv(rows)
+    make_plots(rows)
+    print_table(rows)
