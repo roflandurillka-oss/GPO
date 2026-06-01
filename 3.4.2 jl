@@ -1,0 +1,115 @@
+using CSV
+using DataFrames
+using Plots
+
+python_file = "/user/WAF_DPI_SIEM_Model.py"
+csv_file = "/user/waf_dpi_siem_results.csv"
+
+println(" ")
+println("Запуск модели WAF/DPI с повторными заявками и SIEM")
+println("Python-файл: ", python_file)
+println(" ")
+
+if !isfile(python_file)
+    error("Python-файл не найден: $python_file")
+end
+
+run(`python3 $python_file`)
+
+if !isfile(csv_file)
+    error("CSV-файл не найден: $csv_file")
+end
+
+df = CSV.read(csv_file, DataFrame)
+
+df.scenario_label = replace.(df.scenario, "_" => " ")
+
+println("\nРезультаты моделирования:")
+display(df)
+
+# ГРАФИК 1. СРЕДНЕЕ ЧИСЛО ЗАЯВОК НА ОРБИТЕ
+
+p1 = bar(
+    df.scenario_label,
+    df.avg_orbit,
+    xlabel = "Сценарий",
+    ylabel = "Среднее число заявок на орбите",
+    title = "Среднее число повторных заявок на орбите",
+    label = false,
+    xrotation = 25,
+    grid = true
+)
+
+display(p1)
+savefig(p1, "/user/waf_avg_orbit.png")
+
+# ГРАФИК 2. ПОТЕРИ ЛЕГИТИМНЫХ И АТАКУЮЩИХ ЗАПРОСОВ
+
+p2 = bar(
+    df.scenario_label,
+    [df.legit_loss_probability .* 100 df.attack_loss_probability .* 100],
+    xlabel = "Сценарий",
+    ylabel = "Потери, %",
+    title = "Потери легитимных и атакующих запросов",
+    label = ["Легитимные" "Атака"],
+    xrotation = 25,
+    grid = true
+)
+
+display(p2)
+savefig(p2, "/user/waf_losses_by_type.png")
+
+# ГРАФИК 3. ДОЛЯ ЗАПРОСОВ, ОБСЛУЖЕННЫХ С ПЕРВОЙ ПОПЫТКИ
+
+p3 = bar(
+    df.scenario_label,
+    df.first_attempt_percent,
+    xlabel = "Сценарий",
+    ylabel = "С первой попытки, %",
+    title = "Доля запросов, занявших воркер с первой попытки",
+    label = false,
+    xrotation = 25,
+    grid = true
+)
+
+display(p3)
+savefig(p3, "/user/waf_first_attempt.png")
+
+# ГРАФИК 4. ЗАГРУЗКА ВОРКЕРОВ WAF/DPI
+
+p4 = bar(
+    df.scenario_label,
+    df.utilization .* 100,
+    xlabel = "Сценарий",
+    ylabel = "Загрузка, %",
+    title = "Загрузка воркеров WAF/DPI",
+    label = false,
+    xrotation = 25,
+    grid = true
+)
+
+display(p4)
+savefig(p4, "/user/waf_utilization.png")
+
+# ГРАФИК 5. АКТИВНОСТЬ SIEM-ЗАЩИТЫ
+
+p5 = bar(
+    df.scenario_label,
+    df.siem_active_share .* 100,
+    xlabel = "Сценарий",
+    ylabel = "SIEM активен, %",
+    title = "Доля времени работы SIEM-защиты",
+    label = false,
+    xrotation = 25,
+    grid = true
+)
+
+display(p5)
+savefig(p5, "/user/waf_siem_active_share.png")
+
+println("\nГрафики сохранены:")
+println("/user/waf_avg_orbit.png")
+println("/user/waf_losses_by_type.png")
+println("/user/waf_first_attempt.png")
+println("/user/waf_utilization.png")
+println("/user/waf_siem_active_share.png")
