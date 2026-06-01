@@ -1,0 +1,149 @@
+# Обработка результатов модели M/M/1/r
+
+using CSV
+using DataFrames
+using Plots
+
+# 1. Пути к файлам
+
+python_file = "/user/MM1R_Adaptive.py"
+
+sleep_csv = "/user/sleep_modes.csv"
+queue_csv = "/user/queue_capacity.csv"
+
+energy_plot_file = "/user/plot_energy_sleep.png"
+loss_plot_file = "/user/plot_loss_sleep.png"
+queue_loss_plot_file = "/user/plot_loss_queue.png"
+score_plot_file = "/user/plot_score_sleep.png"
+
+# 2. Запуск Python-модели
+
+println("Запуск Python-модели...")
+
+run(`python $python_file`)
+
+println("Моделирование завершено.")
+println("Проверка наличия CSV-файлов...")
+
+if !isfile(sleep_csv)
+    error("Файл sleep_modes.csv не найден. Проверь, что Python-код сохраняет результаты в /user/sleep_modes.csv")
+end
+
+if !isfile(queue_csv)
+    error("Файл queue_capacity.csv не найден. Проверь, что Python-код сохраняет результаты в /user/queue_capacity.csv")
+end
+
+println("CSV-файлы найдены.")
+
+# 3. Чтение результатов моделирования
+
+sleep_df = CSV.read(sleep_csv, DataFrame)
+queue_df = CSV.read(queue_csv, DataFrame)
+
+println("\nТаблица 1. Сравнение режимов отключения сервера")
+display(sleep_df)
+
+println("\nТаблица 2. Сравнение различных размеров очереди")
+display(queue_df)
+
+# 4. График энергопотребления от T_sleep
+
+energy_plot = plot(
+    sleep_df.T_sleep,
+    sleep_df.energy,
+    marker = :circle,
+    linewidth = 2,
+    xlabel = "T_sleep",
+    ylabel = "Энергопотребление",
+    title = "Влияние времени до отключения на энергопотребление",
+    label = false,
+    grid = true
+)
+
+display(energy_plot)
+savefig(energy_plot, energy_plot_file)
+
+println("График сохранён: ", energy_plot_file)
+
+# 5. График вероятности потерь от T_sleep
+
+loss_plot = plot(
+    sleep_df.T_sleep,
+    sleep_df.loss_probability,
+    marker = :circle,
+    linewidth = 2,
+    xlabel = "T_sleep",
+    ylabel = "Вероятность потерь",
+    title = "Влияние времени до отключения на вероятность потерь",
+    label = false,
+    grid = true
+)
+
+display(loss_plot)
+savefig(loss_plot, loss_plot_file)
+
+println("График сохранён: ", loss_plot_file)
+
+# 6. График вероятности потерь от размера очереди r
+
+queue_loss_plot = plot(
+    queue_df.r_capacity,
+    queue_df.loss_probability,
+    marker = :circle,
+    linewidth = 2,
+    xlabel = "Размер очереди r",
+    ylabel = "Вероятность потерь",
+    title = "Влияние размера очереди на вероятность потерь",
+    label = false,
+    grid = true
+)
+
+display(queue_loss_plot)
+savefig(queue_loss_plot, queue_loss_plot_file)
+
+println("График сохранён: ", queue_loss_plot_file)
+
+# 7. График итогового балла от T_sleep
+
+score_plot = bar(
+    string.(sleep_df.T_sleep),
+    sleep_df.score,
+    xlabel = "T_sleep",
+    ylabel = "Итоговый балл",
+    title = "Сравнение режимов отключения сервера",
+    label = "Балл",
+    grid = true
+)
+
+display(score_plot)
+savefig(score_plot, score_plot_file)
+
+println("График сохранён: ", score_plot_file)
+
+# 8. Поиск лучших режимов
+
+best_sleep_index = argmax(sleep_df.score)
+best_sleep = sleep_df[best_sleep_index, :]
+
+best_queue_index = argmax(queue_df.score)
+best_queue = queue_df[best_queue_index, :]
+
+println("\nЛучший режим отключения сервера по балльной оценке:")
+println("T_sleep = ", best_sleep.T_sleep)
+println("score = ", round(best_sleep.score, digits = 2))
+println("energy = ", round(best_sleep.energy, digits = 2))
+println("loss_probability = ", round(best_sleep.loss_probability, digits = 4))
+
+println("\nЛучший размер очереди по балльной оценке:")
+println("r = ", best_queue.r_capacity)
+println("score = ", round(best_queue.score, digits = 2))
+println("energy = ", round(best_queue.energy, digits = 2))
+println("loss_probability = ", round(best_queue.loss_probability, digits = 4))
+
+# 9. Краткий вывод
+
+println("\nВывод:")
+println("Увеличение T_sleep уменьшает количество частых переходов сервера в режим сна и обратно,")
+println("однако может повышать энергопотребление за счёт более длительного простоя во включённом состоянии.")
+println("Размер очереди r влияет на вероятность потерь и среднее время отклика.")
+println("Полученные таблицы и графики позволяют выбрать рациональные параметры работы датчика.")
