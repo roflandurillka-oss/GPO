@@ -1,0 +1,108 @@
+using CSV
+using DataFrames
+using Plots
+
+python_file = "/user/SOC_Cascade_Model.py"
+csv_file = "/user/soc_cascade_results.csv"
+
+println(" ")
+println("Запуск каскадной SOC-модели с нетерпеливыми заявками")
+println("Python-файл: ", python_file)
+println(" ")
+
+if !isfile(python_file)
+    error("Python-файл не найден: $python_file")
+end
+
+run(`python3 $python_file`)
+
+if !isfile(csv_file)
+    error("CSV-файл не найден: $csv_file")
+end
+
+df = CSV.read(csv_file, DataFrame)
+
+println("\nРезультаты моделирования:")
+display(df)
+
+# ГРАФИК 1. ИТОГОВЫЙ БАЛЛ
+
+p1 = bar(
+    df.policy,
+    df.score,
+    xlabel = "Дисциплина обслуживания",
+    ylabel = "Итоговый балл",
+    title = "Сравнение дисциплин обслуживания по итоговому баллу",
+    label = false,
+    grid = true
+)
+
+display(p1)
+savefig(p1, "/user/soc_score.png")
+
+# ГРАФИК 2. ПОТЕРИ ОБЫЧНЫХ И КРИТИЧЕСКИХ ЗАЯВОК
+
+p2 = bar(
+    df.policy,
+    [df.lost_ordinary df.lost_critical],
+    xlabel = "Дисциплина обслуживания",
+    ylabel = "Количество потерянных заявок",
+    title = "Потери обычных и критических заявок",
+    label = ["Обычные" "Критические"],
+    grid = true
+)
+
+display(p2)
+savefig(p2, "/user/soc_lost_by_type.png")
+
+# ГРАФИК 3. УСПЕШНО ЗАКРЫТЫЕ КРИТИЧЕСКИЕ ЗАЯВКИ
+
+p3 = bar(
+    df.policy,
+    df.completed_critical,
+    xlabel = "Дисциплина обслуживания",
+    ylabel = "Закрытые критические заявки",
+    title = "Количество успешно обработанных критических заявок",
+    label = false,
+    grid = true
+)
+
+display(p3)
+savefig(p3, "/user/soc_completed_critical.png")
+
+# ГРАФИК 4. СРЕДНЕЕ ВРЕМЯ ОЖИДАНИЯ
+
+p4 = bar(
+    df.policy,
+    df.avg_wait,
+    xlabel = "Дисциплина обслуживания",
+    ylabel = "Среднее время ожидания",
+    title = "Среднее время ожидания заявок",
+    label = false,
+    grid = true
+)
+
+display(p4)
+savefig(p4, "/user/soc_avg_wait.png")
+
+# ГРАФИК 5. ЗАГРУЗКА L1 И L2
+
+p5 = bar(
+    df.policy,
+    [df.l1_utilization .* 100 df.l2_utilization .* 100],
+    xlabel = "Дисциплина обслуживания",
+    ylabel = "Загрузка, %",
+    title = "Загрузка серверов L1 и L2",
+    label = ["L1 Анализ" "L2 Реагирование"],
+    grid = true
+)
+
+display(p5)
+savefig(p5, "/user/soc_utilization.png")
+
+println("\nГрафики сохранены:")
+println("/user/soc_score.png")
+println("/user/soc_lost_by_type.png")
+println("/user/soc_completed_critical.png")
+println("/user/soc_avg_wait.png")
+println("/user/soc_utilization.png")
