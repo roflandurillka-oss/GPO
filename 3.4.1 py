@@ -1,0 +1,498 @@
+import csv
+import math
+import random
+import statistics
+
+
+# ПАРАМЕТРЫ МОДЕЛИ
+
+SIM_TIME = 3000.0
+N_REPLICATIONS = 5
+
+# Потоки SOC-событий: средние интервалы между поступлениями
+MTBA_JUNK = 4.0        # "хрень", шумовые события
+MTBA_ORDINARY = 9.0   # обычные инциденты
+MTBA_CRITICAL = 22.0  # критические инциденты
+
+# Средние времена обслуживания
+MST_L1 = 2.8          # первичная фильтрация L1
+MST_L2 = 6.0          # глубокий анализ L2
+
+# Вместимость очередей
+Q1_CAPACITY = 80
+Q2_CAPACITY = 50
+
+# Среднее время терпения заявок
+TAU_JUNK = 15.0
+TAU_ORDINARY = 45.0
+TAU_CRITICAL = 20.0
+
+# Балльная система
+BONUS_Y = 5.0         # бонус за успешно закрытую заявку
+FINE_X = 20.0         # штраф за потерю обычной заявки
+
+# Вероятность закрытия заявки после L1
+P_CLOSE_L1 = {
+    "junk": 0.98,
+    "ordinary": 0.35,
+    "critical": 0.10
+}
+
+TYPES = ["junk", "ordinary", "critical"]
+
+MTBA = {
+    "junk": MTBA_JUNK,
+    "ordinary": MTBA_ORDINARY,
+    "critical": MTBA_CRITICAL
+}
+
+TAU = {
+    "junk": TAU_JUNK,
+    "ordinary": TAU_ORDINARY,
+    "critical": TAU_CRITICAL
+}
+
+FINE = {
+    "junk": 0.0,
+    "ordinary": FINE_X,
+    "critical": 10.0 * FINE_X
+}
+
+
+# МОДЕЛЬ КАСКАДНОЙ SOC-СИСТЕМЫ
+
+class SOCModel:
+    def __init__(self, policy, seed):
+        self.policy = policy
+        self.rng = random.Random(seed)
+
+        self.t = 0.0
+
+        self.queue1 = []
+        self.queue2 = []
+
+        self.next_arrival = {
+            typ: self.rng.expovariate(1.0 / MTBA[typ])
+            for typ in TYPES
+        }
+
+        self.l1_busy = False
+        self.l2_busy = False
+
+        self.l1_job = None
+        self.l2_job = None
+
+        self.l1_done_time = math.inf
+        self.l2_done_time = math.inf
+
+        self.next_id = 0
+        self.score = 0.0
+
+        self.generated = {typ: 0 for typ in TYPES}
+        self.completed = {typ: 0 for typ in TYPES}
+
+        self.lost_patience = {typ: 0 for typ in TYPES}
+        self.lost_queue = {typ: 0 for typ in TYPES}
+
+        self.wait_times = []
+        self.system_times = []
+
+        self.l1_busy_time = 0.0
+        self.l2_busy_time = 0.0
+
+        self.last_stat_time = 0.0
+        self.q1_area = 0.0
+        self.q2_area = 0.0
+
+        self.max_q1 = 0
+        self.max_q2 = 0
+
+
+    def exp_time(self, mean):
+        return self.rng.expovariate(1.0 / mean)
+
+
+    def make_job(self, typ):
+        self.next_id += 1
+
+        patience = self.exp_time(TAU[typ])
+
+        return {
+            "id": self.next_id,
+            "type": typ,
+            "arrival_time": self.t,
+            "deadline": self.t + patience,
+            "wait_started": self.t,
+            "wait_total": 0.0
+        }
+
+
+    def update_time_stats(self, new_time):
+        dt = new_time - self.last_stat_time
+
+        if dt > 0:
+            self.q1_area += len(self.queue1) * dt
+            self.q2_area += len(self.queue2) * dt
+
+            if self.l1_busy:
+                self.l1_busy_time += dt
+
+            if self.l2_busy:
+                self.l2_busy_time += dt
+
+            self.last_stat_time = new_time
+
+
+    def value_index(self, job):
+        """
+        Динамический индекс ценности заявки.
+
+        Чем больше штраф и чем меньше осталось времени терпения,
+        тем выше приоритет заявки.
+        """
+
+        remaining = max(job["deadline"] - self.t, 1e-6)
+        typ = job["type"]
+
+        return (BONUS_Y + FINE[typ]) / remaining
+
+
+    def choose_from_queue(self, queue):
+        if self.policy == "fifo":
+            return queue.pop(0)
+
+        best_idx = max(
+            range(len(queue)),
+            key=lambda i: self.value_index(queue[i])
+        )
+
+        return queue.pop(best_idx)
+
+
+    def add_loss(self, job, reason):
+        typ = job["type"]
+
+        if reason == "patience":
+            self.lost_patience[typ] += 1
+        else:
+            self.lost_queue[typ] += 1
+
+        self.score -= FINE[typ]
+
+
+    def add_complete(self, job):
+        typ = job["type"]
+
+        self.completed[typ] += 1
+        self.score += BONUS_Y
+
+        self.system_times.append(
+            self.t - job["arrival_time"]
+        )
+
+
+    def purge_expired(self):
+        self.queue1 = self.purge_one_queue(self.queue1)
+        self.queue2 = self.purge_one_queue(self.queue2)
+
+    def purge_one_queue(self, queue):
+        kept = []
+
+        for job in queue:
+            if job["deadline"] <= self.t:
+                self.add_loss(job, "patience")
+            else:
+                kept.append(job)
+
+        return kept
+
+
+    def next_deadline(self):
+        deadlines = []
+
+        for job in self.queue1:
+            deadlines.append(job["deadline"])
+
+        for job in self.queue2:
+            deadlines.append(job["deadline"])
+
+        if deadlines:
+            return min(deadlines)
+
+        return math.inf
+
+
+    def enqueue_l1(self, job):
+        if len(self.queue1) >= Q1_CAPACITY:
+            self.add_loss(job, "queue")
+            return
+
+        self.queue1.append(job)
+        self.max_q1 = max(self.max_q1, len(self.queue1))
+
+
+    def enqueue_l2(self, job):
+        if job["deadline"] <= self.t:
+            self.add_loss(job, "patience")
+            return
+
+        if len(self.queue2) >= Q2_CAPACITY:
+            self.add_loss(job, "queue")
+            return
+
+        job["wait_started"] = self.t
+
+        self.queue2.append(job)
+        self.max_q2 = max(self.max_q2, len(self.queue2))
+
+
+    def start_services(self):
+        self.purge_expired()
+
+        if not self.l1_busy and self.queue1:
+            job = self.choose_from_queue(self.queue1)
+
+            job["wait_total"] += self.t - job["wait_started"]
+
+            self.wait_times.append(job["wait_total"])
+
+            self.l1_busy = True
+            self.l1_job = job
+            self.l1_done_time = self.t + self.exp_time(MST_L1)
+
+        if not self.l2_busy and self.queue2:
+            job = self.choose_from_queue(self.queue2)
+
+            job["wait_total"] += self.t - job["wait_started"]
+
+            self.wait_times.append(job["wait_total"])
+
+            self.l2_busy = True
+            self.l2_job = job
+            self.l2_done_time = self.t + self.exp_time(MST_L2)
+
+
+    def handle_arrival(self, typ):
+        self.generated[typ] += 1
+
+        job = self.make_job(typ)
+
+        self.enqueue_l1(job)
+
+        self.next_arrival[typ] = self.t + self.exp_time(MTBA[typ])
+
+    def finish_l1(self):
+        job = self.l1_job
+
+        self.l1_busy = False
+        self.l1_job = None
+        self.l1_done_time = math.inf
+
+        if self.rng.random() < P_CLOSE_L1[job["type"]]:
+            self.add_complete(job)
+        else:
+            self.enqueue_l2(job)
+
+    def finish_l2(self):
+        job = self.l2_job
+
+        self.l2_busy = False
+        self.l2_job = None
+        self.l2_done_time = math.inf
+
+        self.add_complete(job)
+
+    def run(self):
+        self.start_services()
+
+        while self.t < SIM_TIME:
+            next_event_time = min(
+                min(self.next_arrival.values()),
+                self.l1_done_time,
+                self.l2_done_time,
+                self.next_deadline(),
+                SIM_TIME
+            )
+
+            self.update_time_stats(next_event_time)
+            self.t = next_event_time
+
+            if self.t >= SIM_TIME:
+                break
+
+            self.purge_expired()
+
+            if abs(self.t - self.l1_done_time) < 1e-9:
+                self.finish_l1()
+
+            if abs(self.t - self.l2_done_time) < 1e-9:
+                self.finish_l2()
+
+            for typ in TYPES:
+                while self.t >= self.next_arrival[typ] - 1e-9:
+                    self.handle_arrival(typ)
+
+            self.start_services()
+
+        return self.results()
+
+    def results(self):
+        total_generated = sum(self.generated.values())
+        total_completed = sum(self.completed.values())
+
+        total_lost_patience = sum(self.lost_patience.values())
+        total_lost_queue = sum(self.lost_queue.values())
+        total_lost = total_lost_patience + total_lost_queue
+
+        safe_generated = total_generated if total_generated > 0 else 1
+
+        return {
+            "policy": self.policy,
+
+            "score": self.score,
+
+            "generated": total_generated,
+            "completed": total_completed,
+
+            "lost_total": total_lost,
+            "lost_patience": total_lost_patience,
+            "lost_queue": total_lost_queue,
+
+            "lost_junk": self.lost_patience["junk"] + self.lost_queue["junk"],
+            "lost_ordinary": self.lost_patience["ordinary"] + self.lost_queue["ordinary"],
+            "lost_critical": self.lost_patience["critical"] + self.lost_queue["critical"],
+
+            "completed_junk": self.completed["junk"],
+            "completed_ordinary": self.completed["ordinary"],
+            "completed_critical": self.completed["critical"],
+
+            "loss_probability": total_lost / safe_generated,
+
+            "avg_wait": statistics.mean(self.wait_times) if self.wait_times else 0.0,
+            "avg_system": statistics.mean(self.system_times) if self.system_times else 0.0,
+
+            "avg_q1": self.q1_area / SIM_TIME,
+            "avg_q2": self.q2_area / SIM_TIME,
+
+            "max_q1": self.max_q1,
+            "max_q2": self.max_q2,
+
+            "l1_utilization": self.l1_busy_time / SIM_TIME,
+            "l2_utilization": self.l2_busy_time / SIM_TIME
+        }
+
+
+# РЕПЛИКАЦИИ И СОХРАНЕНИЕ
+
+def average_rows(rows):
+    result = {}
+
+    for key in rows[0].keys():
+        if isinstance(rows[0][key], (int, float)):
+            result[key] = statistics.mean(row[key] for row in rows)
+        else:
+            result[key] = rows[0][key]
+
+    return result
+
+
+def run_policy(policy):
+    rows = []
+
+    for rep in range(N_REPLICATIONS):
+        seed = 2026 + rep
+
+        if policy == "dynamic":
+            seed += 1000
+
+        model = SOCModel(policy, seed)
+
+        rows.append(model.run())
+
+    avg = average_rows(rows)
+
+    avg["n_replications"] = N_REPLICATIONS
+    avg["simulation_time"] = SIM_TIME
+
+    return avg
+
+
+def run_experiments():
+    return [
+        run_policy("fifo"),
+        run_policy("dynamic")
+    ]
+
+
+def save_results(rows, filename="/user/soc_cascade_results.csv"):
+    fieldnames = [
+        "policy",
+        "score",
+
+        "generated",
+        "completed",
+
+        "lost_total",
+        "lost_patience",
+        "lost_queue",
+
+        "lost_junk",
+        "lost_ordinary",
+        "lost_critical",
+
+        "completed_junk",
+        "completed_ordinary",
+        "completed_critical",
+
+        "loss_probability",
+
+        "avg_wait",
+        "avg_system",
+
+        "avg_q1",
+        "avg_q2",
+
+        "max_q1",
+        "max_q2",
+
+        "l1_utilization",
+        "l2_utilization",
+
+        "n_replications",
+        "simulation_time"
+    ]
+
+    with open(filename, "w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def print_table(rows):
+    print("\n===== РЕЗУЛЬТАТЫ SOC-МОДЕЛИ =====")
+    print(
+        "policy | score | completed | lost_total | "
+        "lost_ord | lost_crit | avg_wait | avg_system"
+    )
+    print("-" * 100)
+
+    for row in rows:
+        print(
+            f"{row['policy']:<8} | "
+            f"{row['score']:>8.2f} | "
+            f"{row['completed']:>9.1f} | "
+            f"{row['lost_total']:>10.1f} | "
+            f"{row['lost_ordinary']:>8.1f} | "
+            f"{row['lost_critical']:>9.1f} | "
+            f"{row['avg_wait']:>8.3f} | "
+            f"{row['avg_system']:>10.3f}"
+        )
+
+    print("-" * 100)
+
+
+if __name__ == "__main__":
+    rows = run_experiments()
+    save_results(rows)
+    print_table(rows)
+    print("\nCSV сохранён: /user/soc_cascade_results.csv")
