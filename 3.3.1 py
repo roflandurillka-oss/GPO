@@ -1,0 +1,769 @@
+import sys
+sys.path.append("/user/pydeps")
+
+import csv
+import math
+import random
+import statistics
+from dataclasses import dataclass
+
+try:
+    import simpy
+except ModuleNotFoundError:
+    raise ModuleNotFoundError(
+        "Не найдена библиотека simpy. Установи её командой: "
+        "python -m pip install simpy --target=/user/pydeps"
+    )
+
+try:
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:
+    plt = None
+
+
+# ПАРАМЕТРЫ МОДЕЛИ
+
+@dataclass
+class ModelParams:
+    simulation_time: float = 100.0
+    n_replications: int = 2
+    seed: int = 42
+
+    # Внешний поток заявок в API Gateway
+    lambda_0: float = 20.0
+
+    # Доля VIP-заявок
+    p_vip: float = 0.20
+
+    # Интенсивности обслуживания микросервисов
+    # ВАЖНО: API, VIP, Retail, SEPA, SWIFT сделаны достаточно быстрыми,
+    # чтобы узким местом стал Fraud Compliance.
+    mu_api: float = 80.0
+    mu_vip: float = 40.0
+    mu_retail: float = 45.0
+    mu_fraud: float = 18.0
+    mu_sepa: float = 50.0
+    mu_swift: float = 45.0
+
+    # Число параллельных обработчиков
+    n_api: int = 2
+    n_vip: int = 2
+    n_retail: int = 3
+    n_fraud: int = 1
+    n_sepa: int = 1
+    n_swift: int = 1
+
+    # Вместимость очередей
+    r_api: int = 100
+    r_vip: int = 80
+    r_retail: int = 100
+    r_fraud: int = 30
+    r_sepa: int = 80
+    r_swift: int = 80
+
+    # Backpressure:
+    # если очередь Fraud >= threshold_fraud,
+    # Retail-заявки сбрасываются, а VIP продолжают проходить.
+    enable_backpressure: bool = True
+    threshold_fraud: int = 15
+
+
+# УЗЕЛ СЕТИ M/M/n/r
+
+class MMnrNode:
+    def __init__(
+        self,
+        env: simpy.Environment,
+        name: str,
+        mu: float,
+        n_servers: int,
+        queue_capacity: int,
+        rng: random.Random
+    ):
+        self.env = env
+        self.name = name
+        self.mu = mu
+        self.n_servers = n_servers
+        self.queue_capacity = queue_capacity
+        self.rng = rng
+
+        self.resource = simpy.Resource(env, capacity=n_servers)
+
+        self.arrived = 0
+        self.accepted = 0
+        self.processed = 0
+        self.lost = 0
+
+        self.vip_arrived = 0
+        self.vip_lost = 0
+
+        self.retail_arrived = 0
+        self.retail_lost = 0
+
+        self.wait_times = []
+        self.system_times = []
+
+        self.last_queue_update = env.now
+        self.queue_area = 0.0
+        self.max_queue = 0
+
+        self.last_busy_update = env.now
+        self.busy_area = 0.0
+
+    def exp_service_time(self) -> float:
+        if self.mu <= 0:
+            return math.inf
+        return self.rng.expovariate(self.mu)
+
+    def update_queue_stats(self):
+        now = self.env.now
+        dt = now - self.last_queue_update
+
+        if dt > 0:
+            q = len(self.resource.queue)
+            self.queue_area += q * dt
+            self.last_queue_update = now
+            self.max_queue = max(self.max_queue, q)
+
+    def update_busy_stats(self):
+        now = self.env.now
+        dt = now - self.last_busy_update
+
+        if dt > 0:
+            self.busy_area += self.resource.count * dt
+            self.last_busy_update = now
+
+    def current_queue_size(self) -> int:
+        return len(self.resource.queue)
+
+    def can_accept(self) -> bool:
+        if self.resource.count < self.n_servers:
+            return True
+
+        if len(self.resource.queue) < self.queue_capacity:
+            return True
+
+        return False
+
+    def register_loss(self, transaction: dict):
+        self.lost += 1
+
+        if transaction["type"] == "vip":
+            self.vip_lost += 1
+        else:
+            self.retail_lost += 1
+
+        transaction["lost"] = True
+        transaction["lost_node"] = self.name
+
+    def process(self, transaction: dict):
+        self.update_queue_stats()
+        self.update_busy_stats()
+
+        self.arrived += 1
+
+        if transaction["type"] == "vip":
+            self.vip_arrived += 1
+        else:
+            self.retail_arrived += 1
+
+        if not self.can_accept():
+            self.register_loss(transaction)
+            return False
+
+        self.accepted += 1
+        enter_time = self.env.now
+
+        with self.resource.request() as request:
+            yield request
+
+            self.update_queue_stats()
+            self.update_busy_stats()
+
+            wait_time = self.env.now - enter_time
+            self.wait_times.append(wait_time)
+
+            service_time = self.exp_service_time()
+            yield self.env.timeout(service_time)
+
+            self.update_busy_stats()
+
+            system_time = self.env.now - enter_time
+            self.system_times.append(system_time)
+
+            self.processed += 1
+
+        self.update_queue_stats()
+        self.update_busy_stats()
+
+        return True
+
+    def results(self, total_time: float) -> dict:
+        self.update_queue_stats()
+        self.update_busy_stats()
+
+        arrived_safe = self.arrived if self.arrived > 0 else 1
+
+        mean_queue = self.queue_area / total_time
+        utilization = self.busy_area / (total_time * self.n_servers)
+
+        mean_wait = statistics.mean(self.wait_times) if self.wait_times else 0.0
+        mean_system = statistics.mean(self.system_times) if self.system_times else 0.0
+
+        return {
+            "node": self.name,
+            "arrived": self.arrived,
+            "accepted": self.accepted,
+            "processed": self.processed,
+            "lost": self.lost,
+            "loss_probability": self.lost / arrived_safe,
+            "mean_queue": mean_queue,
+            "max_queue": self.max_queue,
+            "mean_wait": mean_wait,
+            "mean_system": mean_system,
+            "utilization": utilization,
+            "vip_arrived": self.vip_arrived,
+            "vip_lost": self.vip_lost,
+            "retail_arrived": self.retail_arrived,
+            "retail_lost": self.retail_lost
+        }
+
+
+# МОДЕЛЬ РАСПРЕДЕЛЁННОЙ СИСТЕМЫ
+
+class JacksonMicroserviceModel:
+    def __init__(self, env: simpy.Environment, params: ModelParams, seed: int):
+        self.env = env
+        self.p = params
+        self.rng = random.Random(seed)
+
+        self.api = MMnrNode(env, "API Gateway", params.mu_api, params.n_api, params.r_api, self.rng)
+        self.vip = MMnrNode(env, "VIP Processing", params.mu_vip, params.n_vip, params.r_vip, self.rng)
+        self.retail = MMnrNode(env, "Retail Processing", params.mu_retail, params.n_retail, params.r_retail, self.rng)
+        self.fraud = MMnrNode(env, "Fraud Compliance", params.mu_fraud, params.n_fraud, params.r_fraud, self.rng)
+        self.sepa = MMnrNode(env, "SEPA Engine", params.mu_sepa, params.n_sepa, params.r_sepa, self.rng)
+        self.swift = MMnrNode(env, "SWIFT Gateway", params.mu_swift, params.n_swift, params.r_swift, self.rng)
+
+        self.nodes = [
+            self.api,
+            self.vip,
+            self.retail,
+            self.fraud,
+            self.sepa,
+            self.swift
+        ]
+
+        self.generated = 0
+        self.completed = 0
+        self.total_lost = 0
+
+        self.vip_generated = 0
+        self.vip_completed = 0
+        self.vip_lost = 0
+
+        self.retail_generated = 0
+        self.retail_completed = 0
+        self.retail_lost = 0
+
+        self.total_system_times = []
+        self.vip_system_times = []
+        self.retail_system_times = []
+
+        self.backpressure_drops = 0
+
+    def exp_arrival_time(self) -> float:
+        if self.p.lambda_0 <= 0:
+            return math.inf
+        return self.rng.expovariate(self.p.lambda_0)
+
+    def transaction_source(self):
+        transaction_id = 0
+
+        while self.env.now < self.p.simulation_time:
+            yield self.env.timeout(self.exp_arrival_time())
+
+            transaction_id += 1
+            self.generated += 1
+
+            is_vip = self.rng.random() < self.p.p_vip
+            transaction_type = "vip" if is_vip else "retail"
+
+            if is_vip:
+                self.vip_generated += 1
+            else:
+                self.retail_generated += 1
+
+            transaction = {
+                "id": transaction_id,
+                "type": transaction_type,
+                "created_time": self.env.now,
+                "lost": False,
+                "lost_node": None
+            }
+
+            self.env.process(self.transaction_route(transaction))
+
+    def mark_lost(self, transaction: dict):
+        self.total_lost += 1
+
+        if transaction["type"] == "vip":
+            self.vip_lost += 1
+        else:
+            self.retail_lost += 1
+
+    def mark_completed(self, transaction: dict):
+        self.completed += 1
+
+        total_time = self.env.now - transaction["created_time"]
+        self.total_system_times.append(total_time)
+
+        if transaction["type"] == "vip":
+            self.vip_completed += 1
+            self.vip_system_times.append(total_time)
+        else:
+            self.retail_completed += 1
+            self.retail_system_times.append(total_time)
+
+    def transaction_route(self, transaction: dict):
+        # 1. Все заявки проходят API Gateway
+        ok = yield self.env.process(self.api.process(transaction))
+
+        if not ok or transaction["lost"]:
+            self.mark_lost(transaction)
+            return
+
+        # 2. Разделение на VIP и Retail
+        if transaction["type"] == "vip":
+            yield self.env.process(self.route_vip(transaction))
+        else:
+            yield self.env.process(self.route_retail(transaction))
+
+    def route_vip(self, transaction: dict):
+        # VIP Processing
+        ok = yield self.env.process(self.vip.process(transaction))
+
+        if not ok or transaction["lost"]:
+            self.mark_lost(transaction)
+            return
+
+        # Все VIP-заявки проходят Fraud
+        ok = yield self.env.process(self.fraud.process(transaction))
+
+        if not ok or transaction["lost"]:
+            self.mark_lost(transaction)
+            return
+
+        # После Fraud VIP-заявки идут в SEPA
+        ok = yield self.env.process(self.sepa.process(transaction))
+
+        if not ok or transaction["lost"]:
+            self.mark_lost(transaction)
+            return
+
+        self.mark_completed(transaction)
+
+    def route_retail(self, transaction: dict):
+        # Backpressure защищает Fraud от перегрузки Retail-потоком.
+        if self.p.enable_backpressure:
+            if self.fraud.current_queue_size() >= self.p.threshold_fraud:
+                self.backpressure_drops += 1
+
+                transaction["lost"] = True
+                transaction["lost_node"] = "Backpressure before Retail"
+
+                self.mark_lost(transaction)
+                return
+
+        # Retail Processing
+        ok = yield self.env.process(self.retail.process(transaction))
+
+        if not ok or transaction["lost"]:
+            self.mark_lost(transaction)
+            return
+
+        # Все Retail-заявки проходят Fraud
+        ok = yield self.env.process(self.fraud.process(transaction))
+
+        if not ok or transaction["lost"]:
+            self.mark_lost(transaction)
+            return
+
+        # После Fraud Retail-заявки идут в SWIFT
+        ok = yield self.env.process(self.swift.process(transaction))
+
+        if not ok or transaction["lost"]:
+            self.mark_lost(transaction)
+            return
+
+        self.mark_completed(transaction)
+
+    def results(self) -> dict:
+        generated_safe = self.generated if self.generated > 0 else 1
+        vip_generated_safe = self.vip_generated if self.vip_generated > 0 else 1
+        retail_generated_safe = self.retail_generated if self.retail_generated > 0 else 1
+
+        mean_total_time = statistics.mean(self.total_system_times) if self.total_system_times else 0.0
+        mean_vip_time = statistics.mean(self.vip_system_times) if self.vip_system_times else 0.0
+        mean_retail_time = statistics.mean(self.retail_system_times) if self.retail_system_times else 0.0
+
+        return {
+            "lambda_0": self.p.lambda_0,
+            "p_vip": self.p.p_vip,
+
+            "generated": self.generated,
+            "completed": self.completed,
+            "total_lost": self.total_lost,
+            "loss_probability_total": self.total_lost / generated_safe,
+
+            "vip_generated": self.vip_generated,
+            "vip_completed": self.vip_completed,
+            "vip_lost": self.vip_lost,
+            "loss_probability_vip": self.vip_lost / vip_generated_safe,
+
+            "retail_generated": self.retail_generated,
+            "retail_completed": self.retail_completed,
+            "retail_lost": self.retail_lost,
+            "loss_probability_retail": self.retail_lost / retail_generated_safe,
+
+            "mean_total_time": mean_total_time,
+            "mean_vip_time": mean_vip_time,
+            "mean_retail_time": mean_retail_time,
+
+            "backpressure_drops": self.backpressure_drops
+        }
+
+    def node_results(self) -> list[dict]:
+        return [node.results(self.p.simulation_time) for node in self.nodes]
+
+
+# ЗАПУСК ОДНОЙ РЕПЛИКАЦИИ
+
+def run_one_replication(params: ModelParams, seed: int):
+    env = simpy.Environment()
+    model = JacksonMicroserviceModel(env, params, seed)
+
+    env.process(model.transaction_source())
+    env.run(until=params.simulation_time)
+
+    return model.results(), model.node_results()
+
+
+# УСРЕДНЕНИЕ РЕЗУЛЬТАТОВ
+
+def average_dicts(rows: list[dict]) -> dict:
+    avg = {}
+
+    for key in rows[0].keys():
+        if isinstance(rows[0][key], (int, float)):
+            avg[key] = statistics.mean(row[key] for row in rows)
+        else:
+            avg[key] = rows[0][key]
+
+    return avg
+
+
+def average_node_results(all_node_results: list[list[dict]]) -> list[dict]:
+    node_names = [node["node"] for node in all_node_results[0]]
+    averaged = []
+
+    for name in node_names:
+        node_rows = []
+
+        for rep in all_node_results:
+            for node in rep:
+                if node["node"] == name:
+                    node_rows.append(node)
+                    break
+
+        averaged.append(average_dicts(node_rows))
+
+    return averaged
+
+
+# СЕРИЯ ЭКСПЕРИМЕНТОВ
+
+def run_scenario(params: ModelParams):
+    system_results = []
+    node_results = []
+
+    for rep in range(params.n_replications):
+        system_result, nodes = run_one_replication(
+            params,
+            seed=params.seed + rep
+        )
+
+        system_results.append(system_result)
+        node_results.append(nodes)
+
+    avg_system = average_dicts(system_results)
+    avg_nodes = average_node_results(node_results)
+
+    avg_system["n_replications"] = params.n_replications
+    avg_system["simulation_time"] = params.simulation_time
+
+    return avg_system, avg_nodes
+
+
+def run_experiments():
+    # Здесь нагрузка специально доводится до зоны перегрузки Fraud.
+    lambda_values = [8, 12, 16, 20, 24, 28, 32]
+
+    base_params = ModelParams(
+        simulation_time=1000.0,
+        n_replications=3,
+        seed=42,
+
+        lambda_0=20.0,
+        p_vip=0.20,
+
+        mu_api=80.0,
+        mu_vip=40.0,
+        mu_retail=45.0,
+        mu_fraud=10.0,
+        mu_sepa=50.0,
+        mu_swift=45.0,
+
+        n_api=2,
+        n_vip=2,
+        n_retail=3,
+        n_fraud=1,
+        n_sepa=1,
+        n_swift=1,
+
+        r_api=100,
+        r_vip=80,
+        r_retail=100,
+        r_fraud=20,
+        r_sepa=80,
+        r_swift=80,
+
+        enable_backpressure=True,
+        threshold_fraud=8
+    )
+
+    scenario_rows = []
+    all_node_rows = []
+
+    for idx, lambda_0 in enumerate(lambda_values):
+        params = ModelParams(**base_params.__dict__)
+        params.lambda_0 = lambda_0
+        params.seed = base_params.seed + idx * 100
+
+        system_result, nodes_result = run_scenario(params)
+
+        scenario_rows.append(system_result)
+
+        for node in nodes_result:
+            row = dict(node)
+            row["lambda_0"] = lambda_0
+            all_node_rows.append(row)
+
+    return scenario_rows, all_node_rows
+
+
+# СОХРАНЕНИЕ CSV
+
+def save_system_results(rows: list[dict], filename="/user/jackson_system_results.csv"):
+    fieldnames = [
+        "lambda_0",
+        "p_vip",
+
+        "generated",
+        "completed",
+        "total_lost",
+        "loss_probability_total",
+
+        "vip_generated",
+        "vip_completed",
+        "vip_lost",
+        "loss_probability_vip",
+
+        "retail_generated",
+        "retail_completed",
+        "retail_lost",
+        "loss_probability_retail",
+
+        "mean_total_time",
+        "mean_vip_time",
+        "mean_retail_time",
+
+        "backpressure_drops",
+        "n_replications",
+        "simulation_time"
+    ]
+
+    with open(filename, "w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for row in rows:
+            writer.writerow(row)
+
+
+def save_node_results(rows: list[dict], filename="/user/jackson_node_results.csv"):
+    fieldnames = [
+        "lambda_0",
+        "node",
+        "arrived",
+        "accepted",
+        "processed",
+        "lost",
+        "loss_probability",
+        "mean_queue",
+        "max_queue",
+        "mean_wait",
+        "mean_system",
+        "utilization",
+        "vip_arrived",
+        "vip_lost",
+        "retail_arrived",
+        "retail_lost"
+    ]
+
+    with open(filename, "w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for row in rows:
+            writer.writerow(row)
+
+
+# ГРАФИКИ PYTHON
+
+def make_python_plots(system_rows: list[dict], node_rows: list[dict]):
+    if plt is None:
+        print("matplotlib не установлен, графики Python не построены.")
+        return
+
+    lambda_values = [row["lambda_0"] for row in system_rows]
+
+    total_loss = [row["loss_probability_total"] * 100 for row in system_rows]
+    vip_loss = [row["loss_probability_vip"] * 100 for row in system_rows]
+    retail_loss = [row["loss_probability_retail"] * 100 for row in system_rows]
+
+    mean_total_time = [row["mean_total_time"] for row in system_rows]
+    mean_vip_time = [row["mean_vip_time"] for row in system_rows]
+    mean_retail_time = [row["mean_retail_time"] for row in system_rows]
+
+    backpressure = [row["backpressure_drops"] for row in system_rows]
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(lambda_values, total_loss, marker="o", label="Общие потери")
+    plt.plot(lambda_values, vip_loss, marker="o", label="VIP")
+    plt.plot(lambda_values, retail_loss, marker="o", label="Retail")
+    plt.xlabel("Интенсивность входящего потока λ0")
+    plt.ylabel("Потери, %")
+    plt.title("Потери заявок при росте нагрузки")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("/user/jackson_loss_vs_lambda.png", dpi=200)
+    plt.close()
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(lambda_values, mean_total_time, marker="o", label="Все заявки")
+    plt.plot(lambda_values, mean_vip_time, marker="o", label="VIP")
+    plt.plot(lambda_values, mean_retail_time, marker="o", label="Retail")
+    plt.xlabel("Интенсивность входящего потока λ0")
+    plt.ylabel("Среднее время пребывания")
+    plt.title("Время пребывания заявок в системе")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("/user/jackson_time_vs_lambda.png", dpi=200)
+    plt.close()
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(lambda_values, backpressure, marker="o")
+    plt.xlabel("Интенсивность входящего потока λ0")
+    plt.ylabel("Число сброшенных Retail-заявок")
+    plt.title("Срабатывания Backpressure")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("/user/jackson_backpressure_vs_lambda.png", dpi=200)
+    plt.close()
+
+    fraud_rows = [row for row in node_rows if row["node"] == "Fraud Compliance"]
+
+    fraud_lambda = [row["lambda_0"] for row in fraud_rows]
+    fraud_util = [row["utilization"] * 100 for row in fraud_rows]
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(fraud_lambda, fraud_util, marker="o")
+    plt.xlabel("Интенсивность входящего потока λ0")
+    plt.ylabel("Загрузка Fraud, %")
+    plt.title("Загрузка критического узла Fraud")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("/user/jackson_fraud_utilization.png", dpi=200)
+    plt.close()
+
+
+# ПЕЧАТЬ РЕЗУЛЬТАТОВ
+
+def print_system_table(rows: list[dict]):
+    print("\n===== ИТОГИ ПО СИСТЕМЕ ДЖЕКСОНА =====")
+    print(
+        "λ0 | Сгенерировано | Завершено | Потери общ., % | "
+        "Потери VIP, % | Потери Retail, % | Tsys VIP | Tsys Retail | Backpressure"
+    )
+    print("-" * 125)
+
+    for row in rows:
+        print(
+            f"{row['lambda_0']:>3.0f} | "
+            f"{row['generated']:>12.1f} | "
+            f"{row['completed']:>9.1f} | "
+            f"{row['loss_probability_total'] * 100:>14.2f} | "
+            f"{row['loss_probability_vip'] * 100:>12.2f} | "
+            f"{row['loss_probability_retail'] * 100:>15.2f} | "
+            f"{row['mean_vip_time']:>8.4f} | "
+            f"{row['mean_retail_time']:>11.4f} | "
+            f"{row['backpressure_drops']:>12.1f}"
+        )
+
+    print("-" * 125)
+
+
+def print_node_table(rows: list[dict]):
+    print("\n===== ИТОГИ ПО УЗЛАМ СЕТИ =====")
+    print(
+        "λ0 | Узел                 | Поступило | Потери, % | Ср. очередь | "
+        "Ср. ожидание | Загрузка, %"
+    )
+    print("-" * 110)
+
+    for row in rows:
+        print(
+            f"{row['lambda_0']:>3.0f} | "
+            f"{row['node']:<20} | "
+            f"{row['arrived']:>9.1f} | "
+            f"{row['loss_probability'] * 100:>9.2f} | "
+            f"{row['mean_queue']:>11.2f} | "
+            f"{row['mean_wait']:>11.4f} | "
+            f"{row['utilization'] * 100:>10.2f}"
+        )
+
+    print("-" * 110)
+
+
+# ОСНОВНОЙ ЗАПУСК
+
+if __name__ == "__main__":
+    system_rows, node_rows = run_experiments()
+
+    save_system_results(system_rows)
+    save_node_results(node_rows)
+
+    # make_python_plots(system_rows, node_rows)
+
+    print_system_table(system_rows)
+    print_node_table(node_rows)
+
+    print("\nФайлы сохранены:")
+    print("/user/jackson_system_results.csv")
+    print("/user/jackson_node_results.csv")
+    print("/user/jackson_loss_vs_lambda.png")
+    print("/user/jackson_time_vs_lambda.png")
+    print("/user/jackson_backpressure_vs_lambda.png")
+    print("/user/jackson_fraud_utilization.png")
