@@ -1,0 +1,266 @@
+using CSV
+using DataFrames
+using Plots
+
+# НАСТРОЙКИ
+
+python_file = "/user/Jackson_Microservice_Model.py"
+
+system_csv = "/user/jackson_system_results.csv"
+node_csv = "/user/jackson_node_results.csv"
+
+stdout_file = "/user/python_stdout.txt"
+stderr_file = "/user/python_stderr.txt"
+debug_file = "/user/debug_check.txt"
+
+println("============================================================")
+println("Запуск модели распределённой системы на основе сети Джексона")
+println("Python-файл: ", python_file)
+println("============================================================")
+
+# ПРОВЕРКА ФАЙЛОВ
+
+open(debug_file, "w") do io
+    println(io, "Проверка файлов")
+    println(io, "python_file = $python_file")
+    println(io, "isfile(python_file) = $(isfile(python_file))")
+    println(io, "pwd = $(pwd())")
+    println(io, "Содержимое /user:")
+    for f in readdir("/user")
+        println(io, f)
+    end
+end
+
+if !isfile(python_file)
+    error("Python-файл не найден: $python_file. Проверь точное имя файла.")
+end
+
+# ЗАПУСК PYTHON С ЗАПИСЬЮ ЛОГОВ
+
+println("Запускаю Python-модель...")
+
+cmd = `python3 $python_file`
+
+try
+    run(pipeline(cmd, stdout=stdout_file, stderr=stderr_file))
+    println("Python-модель завершила работу.")
+catch e
+    println("Python-модель упала.")
+    println("Смотри файл: $stderr_file")
+    println("Также смотри: $stdout_file")
+
+    if isfile(stderr_file)
+        println("\n===== PYTHON STDERR =====")
+        println(read(stderr_file, String))
+    end
+
+    if isfile(stdout_file)
+        println("\n===== PYTHON STDOUT =====")
+        println(read(stdout_file, String))
+    end
+
+    error("Остановка: Python-модель завершилась с ошибкой.")
+end
+
+# ПРОВЕРКА CSV
+
+println("Проверяю CSV-файлы...")
+
+if !isfile(system_csv)
+    println("Файл не найден: $system_csv")
+    println("Вывод Python:")
+    if isfile(stdout_file)
+        println(read(stdout_file, String))
+    end
+    if isfile(stderr_file)
+        println(read(stderr_file, String))
+    end
+    error("Python не создал jackson_system_results.csv")
+end
+
+if !isfile(node_csv)
+    println("Файл не найден: $node_csv")
+    println("Вывод Python:")
+    if isfile(stdout_file)
+        println(read(stdout_file, String))
+    end
+    if isfile(stderr_file)
+        println(read(stderr_file, String))
+    end
+    error("Python не создал jackson_node_results.csv")
+end
+
+println("CSV-файлы найдены.")
+
+# ЧТЕНИЕ РЕЗУЛЬТАТОВ
+
+system_df = CSV.read(system_csv, DataFrame)
+node_df = CSV.read(node_csv, DataFrame)
+
+println("\nИтоговые результаты по системе:")
+display(system_df)
+
+println("\nРезультаты по узлам сети:")
+display(node_df)
+
+# ГРАФИК 1. ПОТЕРИ ЗАЯВОК
+
+println("Строю график 1...")
+
+p1 = plot(
+    system_df.lambda_0,
+    system_df.loss_probability_total .* 100,
+    marker = :circle,
+    linewidth = 2,
+    xlabel = "Интенсивность входящего потока λ₀",
+    ylabel = "Потери, %",
+    title = "Потери заявок при росте нагрузки",
+    label = "Общие потери",
+    grid = true
+)
+
+plot!(
+    p1,
+    system_df.lambda_0,
+    system_df.loss_probability_vip .* 100,
+    marker = :circle,
+    linewidth = 2,
+    label = "VIP"
+)
+
+plot!(
+    p1,
+    system_df.lambda_0,
+    system_df.loss_probability_retail .* 100,
+    marker = :circle,
+    linewidth = 2,
+    label = "Retail"
+)
+
+display(p1)
+savefig(p1, "/user/engee_jackson_loss_vs_lambda.png")
+
+# ГРАФИК 2. ВРЕМЯ ПРЕБЫВАНИЯ
+
+println("Строю график 2...")
+
+p2 = plot(
+    system_df.lambda_0,
+    system_df.mean_total_time,
+    marker = :circle,
+    linewidth = 2,
+    xlabel = "Интенсивность входящего потока λ₀",
+    ylabel = "Среднее время пребывания",
+    title = "Время пребывания заявок в системе",
+    label = "Все заявки",
+    grid = true
+)
+
+plot!(
+    p2,
+    system_df.lambda_0,
+    system_df.mean_vip_time,
+    marker = :circle,
+    linewidth = 2,
+    label = "VIP"
+)
+
+plot!(
+    p2,
+    system_df.lambda_0,
+    system_df.mean_retail_time,
+    marker = :circle,
+    linewidth = 2,
+    label = "Retail"
+)
+
+display(p2)
+savefig(p2, "/user/engee_jackson_time_vs_lambda.png")
+
+# ГРАФИК 3. BACKPRESSURE
+
+println("Строю график 3...")
+
+p3 = plot(
+    system_df.lambda_0,
+    system_df.backpressure_drops,
+    marker = :circle,
+    linewidth = 2,
+    xlabel = "Интенсивность входящего потока λ₀",
+    ylabel = "Число сброшенных Retail-заявок",
+    title = "Срабатывания механизма Backpressure",
+    label = false,
+    grid = true
+)
+
+display(p3)
+savefig(p3, "/user/engee_jackson_backpressure_vs_lambda.png")
+
+# ГРАФИК 4. ЗАГРУЗКА FRAUD
+
+println("Строю график 4...")
+
+fraud_df = filter(row -> row.node == "Fraud Compliance", node_df)
+
+if nrow(fraud_df) == 0
+    error("В node_df не найден узел Fraud Compliance.")
+end
+
+p4 = plot(
+    fraud_df.lambda_0,
+    fraud_df.utilization .* 100,
+    marker = :circle,
+    linewidth = 2,
+    xlabel = "Интенсивность входящего потока λ₀",
+    ylabel = "Загрузка Fraud, %",
+    title = "Загрузка критического узла Fraud",
+    label = false,
+    grid = true
+)
+
+display(p4)
+savefig(p4, "/user/engee_jackson_fraud_utilization.png")
+
+# ГРАФИК 5. ОЧЕРЕДЬ ПО УЗЛАМ
+
+println("Строю график 5...")
+
+max_lambda = maximum(node_df.lambda_0)
+max_load_df = filter(row -> row.lambda_0 == max_lambda, node_df)
+
+p5 = bar(
+    max_load_df.node,
+    max_load_df.mean_queue,
+    xlabel = "Узел системы",
+    ylabel = "Средняя длина очереди",
+    title = "Средняя очередь по узлам при λ₀ = $(max_lambda)",
+    label = false,
+    xrotation = 30,
+    grid = true
+)
+
+display(p5)
+savefig(p5, "/user/engee_jackson_queue_by_node.png")
+
+# ГРАФИК 6. ЗАГРУЗКА УЗЛОВ
+
+println("Строю график 6...")
+
+p6 = bar(
+    max_load_df.node,
+    max_load_df.utilization .* 100,
+    xlabel = "Узел системы",
+    ylabel = "Загрузка, %",
+    title = "Загрузка узлов при λ₀ = $(max_lambda)",
+    label = false,
+    xrotation = 30,
+    grid = true
+)
+
+display(p6)
+savefig(p6, "/user/engee_jackson_utilization_by_node.png")
+
+println("\n ")
+println("Работа Start.ngscript завершена успешно.")
+println("Графики сохранены в /user")
+println(" ")
