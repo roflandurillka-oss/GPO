@@ -1,0 +1,92 @@
+using CSV
+using DataFrames
+using Plots
+
+python_file = "/user/WLAN_DOS_AP.py"
+csv_file = "/user/wlan_dos_results.csv"
+
+println("Запуск Python-модели DoS-атаки на точку доступа...")
+run(`python $python_file`)
+
+if !isfile(csv_file)
+    error("Файл wlan_dos_results.csv не найден. Проверь запуск Python-модели.")
+end
+
+df = CSV.read(csv_file, DataFrame)
+
+println("\nТаблица результатов моделирования:")
+display(df)
+
+# График 1. Время работы точки доступа
+
+p1 = plot(
+    df.attack_rate,
+    df.t_work,
+    marker = :circle,
+    linewidth = 2,
+    xlabel = "Интенсивность атаки f, пак/сек",
+    ylabel = "Twork, сек",
+    title = "Время стабильной работы точки доступа",
+    label = false,
+    grid = true
+)
+
+display(p1)
+savefig(p1, "/user/engee_twork_vs_attack.png")
+
+# График 2. Вероятность потерь
+
+p2 = plot(
+    df.attack_rate,
+    df.loss_probability_total .* 100,
+    marker = :circle,
+    linewidth = 2,
+    xlabel = "Интенсивность атаки f, пак/сек",
+    ylabel = "Потери, %",
+    title = "Вероятность потерь при DoS-атаке",
+    label = false,
+    grid = true
+)
+
+display(p2)
+savefig(p2, "/user/engee_loss_vs_attack.png")
+
+# График 3. Средняя длина очереди
+
+p3 = plot(
+    df.attack_rate,
+    df.mean_queue,
+    marker = :circle,
+    linewidth = 2,
+    xlabel = "Интенсивность атаки f, пак/сек",
+    ylabel = "Средняя длина очереди",
+    title = "Заполнение буфера точки доступа",
+    label = false,
+    grid = true
+)
+
+display(p3)
+savefig(p3, "/user/engee_queue_vs_attack.png")
+
+# График 4. Число пакетов до отказа
+
+p4 = plot(
+    df.attack_rate,
+    df.packets_to_fail,
+    marker = :circle,
+    linewidth = 2,
+    xlabel = "Интенсивность атаки f, пак/сек",
+    ylabel = "Пакетов до отказа",
+    title = "Число пакетов, нарушивших работу AP",
+    label = false,
+    grid = true
+)
+
+display(p4)
+savefig(p4, "/user/engee_packets_to_fail.png")
+
+println("\nГрафики сохранены в /user/")
+println("engee_twork_vs_attack.png")
+println("engee_loss_vs_attack.png")
+println("engee_queue_vs_attack.png")
+println("engee_packets_to_fail.png")
