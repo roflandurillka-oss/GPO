@@ -1,0 +1,504 @@
+import csv
+import heapq
+import random
+import statistics
+
+
+# ПАРАМЕТРЫ МОДЕЛИ
+
+SIM_TIME = 3000.0
+N_REPLICATIONS = 5
+
+# Число воркеров WAF/DPI
+V_WORKERS = 3
+
+# Ограниченная орбита повторных заявок
+ORBIT_CAPACITY = 80
+
+# Легитимный поток
+MTBA_LEGIT = 4.0
+MST_LEGIT = 2.0
+MRT_LEGIT = 8.0
+
+# Атакующий поток
+MTBA_ATTACK_NORMAL = 12.0
+MTBA_ATTACK_FLOOD = 1.2
+
+# Тяжёлое обслуживание атакующих запросов:
+# имитация HTTP Flood / Slowloris / обхода сигнатур
+MST_ATTACK = 8.0
+MRT_ATTACK = 4.0
+
+# SIEM-логика
+SIEM_THRESHOLD_ON = 45
+SIEM_THRESHOLD_OFF = 20
+SIEM_BLOCK_PROBABILITY = 0.85
+SIEM_ATTACK_RETRY_MULTIPLIER = 4.0
+
+TYPES = ["legit", "attack"]
+
+
+# МОДЕЛЬ WAF/DPI + SIEM
+
+class WAFDPISIEMModel:
+    def __init__(self, scenario_name, attack_flood, siem_enabled, seed):
+        self.scenario_name = scenario_name
+        self.attack_flood = attack_flood
+        self.siem_enabled = siem_enabled
+        self.rng = random.Random(seed)
+
+        self.t = 0.0
+        self.event_id = 0
+        self.events = []
+
+        self.workers = [None for _ in range(V_WORKERS)]
+
+        self.orbit = {}
+        self.next_job_id = 0
+
+        self.siem_active = False
+
+        # Статистика
+        self.generated = {typ: 0 for typ in TYPES}
+        self.completed = {typ: 0 for typ in TYPES}
+        self.lost_orbit_full = {typ: 0 for typ in TYPES}
+        self.blocked_siem = {typ: 0 for typ in TYPES}
+
+        self.first_attempt_completed = {typ: 0 for typ in TYPES}
+
+        self.attempts_served = []
+        self.attempts_lost = []
+
+        self.system_times_served = []
+        self.system_times_lost = []
+
+        self.orbit_wait_times = []
+
+        self.orbit_area = 0.0
+        self.busy_area = 0.0
+        self.siem_area = 0.0
+
+        self.max_orbit = 0
+        self.last_stat_time = 0.0
+
+
+    def push_event(self, time, event_type, data=None):
+        self.event_id += 1
+        heapq.heappush(self.events, (time, self.event_id, event_type, data))
+
+
+    def exp_time(self, mean):
+        return self.rng.expovariate(1.0 / mean)
+
+
+    def attack_mtba(self):
+        if self.attack_flood:
+            return MTBA_ATTACK_FLOOD
+        return MTBA_ATTACK_NORMAL
+
+
+    def service_time(self, job_type):
+        if job_type == "legit":
+            return self.exp_time(MST_LEGIT)
+        return self.exp_time(MST_ATTACK)
+
+
+    def retry_time(self, job_type):
+        if job_type == "legit":
+            return self.exp_time(MRT_LEGIT)
+
+        mean_retry = MRT_ATTACK
+
+        if self.siem_enabled and self.siem_active:
+            mean_retry *= SIEM_ATTACK_RETRY_MULTIPLIER
+
+        return self.exp_time(mean_retry)
+
+
+    def update_time_stats(self, new_time):
+        dt = new_time - self.last_stat_time
+
+        if dt <= 0:
+            return
+
+        busy_count = sum(1 for worker in self.workers if worker is not None)
+
+        self.orbit_area += len(self.orbit) * dt
+        self.busy_area += busy_count * dt
+
+        if self.siem_active:
+            self.siem_area += dt
+
+        self.last_stat_time = new_time
+
+
+    def update_siem_state(self):
+        if not self.siem_enabled:
+            self.siem_active = False
+            return
+
+        orbit_size = len(self.orbit)
+
+        if not self.siem_active and orbit_size >= SIEM_THRESHOLD_ON:
+            self.siem_active = True
+
+        elif self.siem_active and orbit_size <= SIEM_THRESHOLD_OFF:
+            self.siem_active = False
+
+
+    def free_worker_index(self):
+        for i, job in enumerate(self.workers):
+            if job is None:
+                return i
+        return None
+
+
+    def create_job(self, job_type):
+        self.next_job_id += 1
+
+        return {
+            "id": self.next_job_id,
+            "type": job_type,
+            "arrival_time": self.t,
+            "attempts": 0,
+            "first_attempt": True
+        }
+
+
+    def start_service(self, job):
+        worker_idx = self.free_worker_index()
+
+        if worker_idx is None:
+            return False
+
+        self.workers[worker_idx] = job
+
+        finish_time = self.t + self.service_time(job["type"])
+        self.push_event(finish_time, "finish", worker_idx)
+
+        if not job["first_attempt"]:
+            self.orbit_wait_times.append(self.t - job["arrival_time"])
+
+        return True
+
+
+    def send_to_orbit(self, job):
+        if len(self.orbit) >= ORBIT_CAPACITY:
+            typ = job["type"]
+            self.lost_orbit_full[typ] += 1
+            self.attempts_lost.append(job["attempts"])
+            self.system_times_lost.append(self.t - job["arrival_time"])
+            return
+
+        job["first_attempt"] = False
+        self.orbit[job["id"]] = job
+        self.max_orbit = max(self.max_orbit, len(self.orbit))
+
+        retry_at = self.t + self.retry_time(job["type"])
+        self.push_event(retry_at, "retry", job["id"])
+
+
+    def handle_arrival(self, job_type):
+        self.generated[job_type] += 1
+
+        # SIEM блокирует часть атакующих запросов до входа в WAF/DPI.
+        if (
+            self.siem_enabled
+            and self.siem_active
+            and job_type == "attack"
+            and self.rng.random() < SIEM_BLOCK_PROBABILITY
+        ):
+            self.blocked_siem[job_type] += 1
+            return
+
+        job = self.create_job(job_type)
+        job["attempts"] += 1
+
+        if self.start_service(job):
+            pass
+        else:
+            self.send_to_orbit(job)
+
+        mean = MTBA_LEGIT if job_type == "legit" else self.attack_mtba()
+        self.push_event(self.t + self.exp_time(mean), "arrival", job_type)
+
+
+    def handle_retry(self, job_id):
+        job = self.orbit.get(job_id)
+
+        if job is None:
+            return
+
+        # SIEM может задерживать и частично блокировать повторные атаки.
+        if (
+            self.siem_enabled
+            and self.siem_active
+            and job["type"] == "attack"
+            and self.rng.random() < SIEM_BLOCK_PROBABILITY
+        ):
+            del self.orbit[job_id]
+            self.blocked_siem["attack"] += 1
+            self.attempts_lost.append(job["attempts"])
+            self.system_times_lost.append(self.t - job["arrival_time"])
+            return
+
+        job["attempts"] += 1
+
+        if self.start_service(job):
+            del self.orbit[job_id]
+        else:
+            retry_at = self.t + self.retry_time(job["type"])
+            self.push_event(retry_at, "retry", job_id)
+
+
+    def handle_finish(self, worker_idx):
+        job = self.workers[worker_idx]
+
+        if job is None:
+            return
+
+        typ = job["type"]
+
+        self.completed[typ] += 1
+
+        if job["attempts"] == 1:
+            self.first_attempt_completed[typ] += 1
+
+        self.attempts_served.append(job["attempts"])
+        self.system_times_served.append(self.t - job["arrival_time"])
+
+        self.workers[worker_idx] = None
+
+
+    def run(self):
+        self.push_event(self.exp_time(MTBA_LEGIT), "arrival", "legit")
+        self.push_event(self.exp_time(self.attack_mtba()), "arrival", "attack")
+
+        while self.events:
+            time, _, event_type, data = heapq.heappop(self.events)
+
+            if time > SIM_TIME:
+                self.update_time_stats(SIM_TIME)
+                break
+
+            self.update_time_stats(time)
+            self.t = time
+
+            self.update_siem_state()
+
+            if event_type == "arrival":
+                self.handle_arrival(data)
+
+            elif event_type == "retry":
+                self.handle_retry(data)
+
+            elif event_type == "finish":
+                self.handle_finish(data)
+
+            self.update_siem_state()
+
+        return self.results()
+
+
+    def results(self):
+        generated_total = sum(self.generated.values())
+        completed_total = sum(self.completed.values())
+
+        lost_orbit_total = sum(self.lost_orbit_full.values())
+        blocked_siem_total = sum(self.blocked_siem.values())
+
+        lost_total = lost_orbit_total + blocked_siem_total
+
+        safe_generated = generated_total if generated_total > 0 else 1
+        safe_completed = completed_total if completed_total > 0 else 1
+
+        first_attempt_total = sum(self.first_attempt_completed.values())
+
+        return {
+            "scenario": self.scenario_name,
+            "siem_enabled": 1 if self.siem_enabled else 0,
+            "attack_flood": 1 if self.attack_flood else 0,
+
+            "generated_total": generated_total,
+            "generated_legit": self.generated["legit"],
+            "generated_attack": self.generated["attack"],
+
+            "completed_total": completed_total,
+            "completed_legit": self.completed["legit"],
+            "completed_attack": self.completed["attack"],
+
+            "lost_total": lost_total,
+            "lost_orbit_full": lost_orbit_total,
+            "blocked_siem": blocked_siem_total,
+
+            "lost_legit": self.lost_orbit_full["legit"] + self.blocked_siem["legit"],
+            "lost_attack": self.lost_orbit_full["attack"] + self.blocked_siem["attack"],
+
+            "loss_probability": lost_total / safe_generated,
+            "legit_loss_probability": (
+                (self.lost_orbit_full["legit"] + self.blocked_siem["legit"])
+                / max(self.generated["legit"], 1)
+            ),
+            "attack_loss_probability": (
+                (self.lost_orbit_full["attack"] + self.blocked_siem["attack"])
+                / max(self.generated["attack"], 1)
+            ),
+
+            "first_attempt_percent": first_attempt_total / safe_completed * 100.0,
+
+            "avg_orbit": self.orbit_area / SIM_TIME,
+            "max_orbit": self.max_orbit,
+
+            "utilization": self.busy_area / (SIM_TIME * V_WORKERS),
+
+            "avg_attempts_served": (
+                statistics.mean(self.attempts_served)
+                if self.attempts_served else 0.0
+            ),
+            "avg_attempts_lost": (
+                statistics.mean(self.attempts_lost)
+                if self.attempts_lost else 0.0
+            ),
+
+            "avg_system_served": (
+                statistics.mean(self.system_times_served)
+                if self.system_times_served else 0.0
+            ),
+            "avg_system_lost": (
+                statistics.mean(self.system_times_lost)
+                if self.system_times_lost else 0.0
+            ),
+
+            "avg_orbit_wait": (
+                statistics.mean(self.orbit_wait_times)
+                if self.orbit_wait_times else 0.0
+            ),
+
+            "siem_active_share": self.siem_area / SIM_TIME
+        }
+
+
+# РЕПЛИКАЦИИ
+
+def average_rows(rows):
+    result = {}
+
+    for key in rows[0].keys():
+        if isinstance(rows[0][key], (int, float)):
+            result[key] = statistics.mean(row[key] for row in rows)
+        else:
+            result[key] = rows[0][key]
+
+    return result
+
+
+def run_scenario(scenario_name, attack_flood, siem_enabled, seed_shift):
+    rows = []
+
+    for rep in range(N_REPLICATIONS):
+        seed = 5000 + seed_shift + rep
+        model = WAFDPISIEMModel(scenario_name, attack_flood, siem_enabled, seed)
+        rows.append(model.run())
+
+    avg = average_rows(rows)
+    avg["n_replications"] = N_REPLICATIONS
+    avg["simulation_time"] = SIM_TIME
+
+    return avg
+
+
+def run_experiments():
+    scenarios = [
+        ("normal_no_siem", False, False, 0),
+        ("attack_no_siem", True, False, 1000),
+        ("attack_with_siem", True, True, 2000)
+    ]
+
+    results = []
+
+    for name, attack_flood, siem_enabled, seed_shift in scenarios:
+        print(f"Запуск сценария: {name}", flush=True)
+        results.append(run_scenario(name, attack_flood, siem_enabled, seed_shift))
+
+    return results
+
+
+def save_results(rows, filename="/user/waf_dpi_siem_results.csv"):
+    fieldnames = [
+        "scenario",
+        "siem_enabled",
+        "attack_flood",
+
+        "generated_total",
+        "generated_legit",
+        "generated_attack",
+
+        "completed_total",
+        "completed_legit",
+        "completed_attack",
+
+        "lost_total",
+        "lost_orbit_full",
+        "blocked_siem",
+        "lost_legit",
+        "lost_attack",
+
+        "loss_probability",
+        "legit_loss_probability",
+        "attack_loss_probability",
+
+        "first_attempt_percent",
+
+        "avg_orbit",
+        "max_orbit",
+
+        "utilization",
+
+        "avg_attempts_served",
+        "avg_attempts_lost",
+
+        "avg_system_served",
+        "avg_system_lost",
+
+        "avg_orbit_wait",
+
+        "siem_active_share",
+
+        "n_replications",
+        "simulation_time"
+    ]
+
+    with open(filename, "w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def print_table(rows):
+    print("\n===== РЕЗУЛЬТАТЫ WAF/DPI + SIEM =====")
+    print(
+        "scenario | completed | lost % | legit lost % | "
+        "avg orbit | util % | first attempt % | SIEM active %"
+    )
+    print("-" * 110)
+
+    for r in rows:
+        print(
+            f"{r['scenario']:<16} | "
+            f"{r['completed_total']:>9.1f} | "
+            f"{r['loss_probability'] * 100:>6.2f} | "
+            f"{r['legit_loss_probability'] * 100:>12.2f} | "
+            f"{r['avg_orbit']:>9.2f} | "
+            f"{r['utilization'] * 100:>6.2f} | "
+            f"{r['first_attempt_percent']:>15.2f} | "
+            f"{r['siem_active_share'] * 100:>12.2f}"
+        )
+
+    print("-" * 110)
+
+
+if __name__ == "__main__":
+    rows = run_experiments()
+    save_results(rows)
+    print_table(rows)
+    print("\nCSV сохранён: /user/waf_dpi_siem_results.csv")
