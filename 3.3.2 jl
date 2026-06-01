@@ -1,0 +1,132 @@
+using CSV
+using DataFrames
+using Plots
+
+python_file = "/user/SCADA_Reserve_Model.py"
+csv_file = "/user/scada_reserve_results.csv"
+
+println("============================================================")
+println("Запуск модели G/M/2 с ненадёжными серверами и резервированием")
+println("Python-файл: ", python_file)
+println("============================================================")
+
+if !isfile(python_file)
+    error("Python-файл не найден: $python_file")
+end
+
+run(`python3 $python_file`)
+
+if !isfile(csv_file)
+    error("CSV-файл не найден: $csv_file")
+end
+
+df = CSV.read(csv_file, DataFrame)
+
+df.scenario = string.(uppercasefirst.(df.mode), " / attack=", df.attack)
+
+println("\nРезультаты моделирования:")
+display(df)
+
+# ГРАФИК 1. СРЕДНЕЕ ВРЕМЯ ОЖИДАНИЯ
+
+p1 = bar(
+    df.scenario,
+    df.avg_wait,
+    xlabel = "Сценарий",
+    ylabel = "Среднее время ожидания",
+    title = "Среднее время ожидания заявок",
+    label = false,
+    xrotation = 30,
+    grid = true
+)
+
+display(p1)
+savefig(p1, "/user/scada_avg_wait.png")
+
+# ГРАФИК 2. СРЕДНЕЕ ВРЕМЯ ПРЕБЫВАНИЯ
+
+p2 = bar(
+    df.scenario,
+    df.avg_system,
+    xlabel = "Сценарий",
+    ylabel = "Среднее время пребывания",
+    title = "Среднее время пребывания заявок в системе",
+    label = false,
+    xrotation = 30,
+    grid = true
+)
+
+display(p2)
+savefig(p2, "/user/scada_avg_system.png")
+
+# ГРАФИК 3. ВЕРОЯТНОСТЬ ПОТЕРЬ
+
+p3 = bar(
+    df.scenario,
+    df.loss_probability .* 100,
+    xlabel = "Сценарий",
+    ylabel = "Потери, %",
+    title = "Вероятность потерь заявок",
+    label = false,
+    xrotation = 30,
+    grid = true
+)
+
+display(p3)
+savefig(p3, "/user/scada_loss_probability.png")
+
+# ГРАФИК 4. КОЛИЧЕСТВО ОТКАЗОВ
+
+p4 = bar(
+    df.scenario,
+    df.failures,
+    xlabel = "Сценарий",
+    ylabel = "Среднее число отказов",
+    title = "Количество отказов серверов",
+    label = false,
+    xrotation = 30,
+    grid = true
+)
+
+display(p4)
+savefig(p4, "/user/scada_failures.png")
+
+# ГРАФИК 5. ПЕРЕКЛЮЧЕНИЯ НА РЕЗЕРВ
+
+p5 = bar(
+    df.scenario,
+    df.switches,
+    xlabel = "Сценарий",
+    ylabel = "Среднее число переключений",
+    title = "Переключения на резервный сервер",
+    label = false,
+    xrotation = 30,
+    grid = true
+)
+
+display(p5)
+savefig(p5, "/user/scada_switches.png")
+
+# ГРАФИК 6. ДОЛЯ ВРЕМЕНИ БЕЗ АКТИВНОГО СЕРВЕРА
+
+p6 = bar(
+    df.scenario,
+    df.no_active_share .* 100,
+    xlabel = "Сценарий",
+    ylabel = "Время без активного сервера, %",
+    title = "Доля времени без доступного сервера",
+    label = false,
+    xrotation = 30,
+    grid = true
+)
+
+display(p6)
+savefig(p6, "/user/scada_no_active_share.png")
+
+println("\nГрафики сохранены:")
+println("/user/scada_avg_wait.png")
+println("/user/scada_avg_system.png")
+println("/user/scada_loss_probability.png")
+println("/user/scada_failures.png")
+println("/user/scada_switches.png")
+println("/user/scada_no_active_share.png")
