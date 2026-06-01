@@ -1,0 +1,650 @@
+import sys
+sys.path.append("/user/pydeps")
+
+import simpy
+import random
+import statistics
+import csv
+from dataclasses import dataclass
+
+
+# ПАРАМЕТРЫ МОДЕЛИ
+
+@dataclass
+class ModelParams:
+    # Репликации
+    n_replications: int = 20
+    replication_time: float = 30_000
+
+    # M/M/1/r
+    mtba: float = 40.0              # среднее время между поступлениями событий
+    mst: float = 38.0               # среднее время обработки события
+    r_capacity: int = 15            # максимальная длина очереди r
+
+    # Буфер датчика
+    buffer_bytes: float = 50_000
+    avg_event_size: float = 2_000
+
+    # Отключение сервера
+    t_sleep: float = 20.0          # время бездействия до перехода в сон
+    t_wake: float = 8.0            # время пробуждения сервера
+
+    # Энергопотребление
+    p_active: float = 10.0         # сервер обрабатывает заявку
+    p_idle: float = 3.0            # сервер включён, но простаивает
+    p_sleep: float = 0.5           # сервер в режиме энергосбережения
+    p_wake: float = 8.0            # сервер пробуждается
+
+    # Ограничение по качеству обслуживания
+    d_max: float = 30.0            # допустимое время отклика
+
+    # Балльная система: награды
+    reward_completed: float = 2.0
+    reward_on_time: float = 3.0
+    reward_energy_saved: float = 0.001
+
+    # Балльная система: штрафы
+    penalty_lost_buffer: float = 10.0
+    penalty_rejected_adaptive: float = 5.0
+    penalty_late_per_time: float = 0.2
+    penalty_wakeup: float = 1.0
+    penalty_unfinished: float = 4.0
+
+    # Случайность
+    seed: int = 42
+
+
+# МОДЕЛЬ M/M/1/r С ОТКЛЮЧЕНИЕМ СЕРВЕРА
+# И ЗАВИСИМЫМ ДОПУСКОМ ЗАЯВОК
+
+class AdaptiveMM1rSensorModel:
+    def __init__(self, env: simpy.Environment, params: ModelParams, seed: int):
+        self.env = env
+        self.p = params
+        self.rng = random.Random(seed)
+
+        # Очередь и буфер
+        self.queue = []
+        self.buffer_used = 0.0
+
+        # Состояние сервера
+        self.server_busy = False
+        self.server_sleep = False
+        self.server_waking = False
+
+        # Для отмены устаревших таймеров сна
+        self.sleep_generation = 0
+
+        # Текущее состояние для подсчёта энергии
+        self.current_state = "IDLE"
+        self.last_state_change = env.now
+
+        self.energy = 0.0
+        self.state_time = {
+            "ACTIVE": 0.0,
+            "IDLE": 0.0,
+            "SLEEP": 0.0,
+            "WAKE": 0.0
+        }
+
+        # Статистика
+        self.arrived = 0
+        self.accepted = 0
+        self.completed = 0
+
+        self.lost_buffer = 0
+        self.rejected_adaptive = 0
+
+        self.on_time = 0
+        self.wakeup_count = 0
+
+        self.wait_times = []
+        self.response_times = []
+
+    # Случайные величины
+
+    def exp_time(self, mean: float) -> float:
+        return self.rng.expovariate(1.0 / mean)
+
+    def event_size(self) -> float:
+        return max(100.0, self.exp_time(self.p.avg_event_size))
+
+    # Зависимый поток заявок от длины очереди
+
+    def accept_probability(self) -> float:
+       
+        """
+        Вероятность принять событие в буфер зависит от длины очереди
+
+        p_accept(q) = 1 - q / r
+
+        q = 0  -> p_accept = 1
+        q = r  -> p_accept = 0
+        """
+
+        q = len(self.queue)
+
+        if self.p.r_capacity <= 0:
+            return 0.0
+
+        p_accept = 1.0 - (q / self.p.r_capacity)
+        return max(0.0, min(1.0, p_accept))
+
+    def can_fit_buffer(self, size: float) -> bool:
+        queue_has_place = len(self.queue) < self.p.r_capacity
+        buffer_has_place = self.buffer_used + size <= self.p.buffer_bytes
+        return queue_has_place and buffer_has_place
+
+    # Учёт энергопотребления
+
+    def change_state(self, new_state: str):
+        now = self.env.now
+        dt = now - self.last_state_change
+
+        if dt > 0:
+            if self.current_state == "ACTIVE":
+                power = self.p.p_active
+            elif self.current_state == "IDLE":
+                power = self.p.p_idle
+            elif self.current_state == "SLEEP":
+                power = self.p.p_sleep
+            elif self.current_state == "WAKE":
+                power = self.p.p_wake
+            else:
+                power = 0.0
+
+            self.energy += power * dt
+            self.state_time[self.current_state] += dt
+
+        self.current_state = new_state
+        self.last_state_change = now
+
+    # Поступление заявок
+
+    def arrival_process(self):
+        while True:
+            yield self.env.timeout(self.exp_time(self.p.mtba))
+
+            self.arrived += 1
+            arrival_time = self.env.now
+            size = self.event_size()
+
+            # 1. Адаптивное ограничение входа.
+            # Чем больше очередь, тем меньше вероятность принять событие.
+            p_accept = self.accept_probability()
+
+            if self.rng.random() > p_accept:
+                self.rejected_adaptive += 1
+                continue
+
+            # 2. Физическое ограничение очереди и буфера.
+            if not self.can_fit_buffer(size):
+                self.lost_buffer += 1
+                continue
+
+            self.accepted += 1
+
+            request = {
+                "id": self.arrived,
+                "arrival_time": arrival_time,
+                "size": size
+            }
+
+            self.queue.append(request)
+            self.buffer_used += size
+
+            # Новая заявка отменяет старый таймер ухода в сон.
+            self.sleep_generation += 1
+
+            # Если сервер спит, запускаем пробуждение.
+            if self.server_sleep:
+                self.env.process(self.wake_server())
+
+            # Если сервер свободен, запускаем обслуживание.
+            if not self.server_busy and not self.server_waking and not self.server_sleep:
+                self.env.process(self.service_process())
+
+    # Обслуживание заявок
+
+    def service_process(self):
+        if self.server_busy or self.server_waking or self.server_sleep:
+            return
+
+        while self.queue:
+            self.server_busy = True
+            self.change_state("ACTIVE")
+
+            request = self.queue.pop(0)
+            self.buffer_used -= request["size"]
+
+            wait_time = self.env.now - request["arrival_time"]
+            self.wait_times.append(wait_time)
+
+            service_time = self.exp_time(self.p.mst)
+            yield self.env.timeout(service_time)
+
+            response_time = self.env.now - request["arrival_time"]
+            self.response_times.append(response_time)
+
+            self.completed += 1
+
+            if response_time <= self.p.d_max:
+                self.on_time += 1
+
+            self.server_busy = False
+
+        # Если очередь опустела, сервер простаивает и может уйти в сон.
+        self.change_state("IDLE")
+        self.schedule_sleep_timer()
+
+    # Планирование ухода в сон
+
+    def schedule_sleep_timer(self):
+        self.sleep_generation += 1
+        current_generation = self.sleep_generation
+        self.env.process(self.sleep_after_idle(current_generation))
+
+    def sleep_after_idle(self, generation_id: int):
+        yield self.env.timeout(self.p.t_sleep)
+
+        # Если за время ожидания пришла новая заявка, generation_id устареет.
+        if generation_id != self.sleep_generation:
+            return
+
+        if (
+            not self.server_busy
+            and not self.queue
+            and not self.server_sleep
+            and not self.server_waking
+        ):
+            self.server_sleep = True
+            self.change_state("SLEEP")
+
+    # Пробуждение сервера
+
+    def wake_server(self):
+        if self.server_waking or not self.server_sleep:
+            return
+
+        self.server_waking = True
+        self.server_sleep = False
+        self.wakeup_count += 1
+
+        self.change_state("WAKE")
+        yield self.env.timeout(self.p.t_wake)
+
+        self.server_waking = False
+        self.change_state("IDLE")
+
+        if self.queue:
+            self.env.process(self.service_process())
+        else:
+            self.schedule_sleep_timer()
+
+    # Завершение учёта энергии
+
+    def finish_energy_count(self):
+        self.change_state(self.current_state)
+
+    # Балльная система
+
+    def calculate_score(self) -> float:
+        unfinished = len(self.queue)
+
+        baseline_energy = self.p.p_active * self.p.replication_time
+        energy_saved = max(0.0, baseline_energy - self.energy)
+
+        late_penalty = 0.0
+        for rt in self.response_times:
+            late_penalty += max(0.0, rt - self.p.d_max) * self.p.penalty_late_per_time
+
+        score = 0.0
+
+        # Награды
+        score += self.completed * self.p.reward_completed
+        score += self.on_time * self.p.reward_on_time
+        score += energy_saved * self.p.reward_energy_saved
+
+        # Штрафы
+        score -= self.lost_buffer * self.p.penalty_lost_buffer
+        score -= self.rejected_adaptive * self.p.penalty_rejected_adaptive
+        score -= late_penalty
+        score -= self.wakeup_count * self.p.penalty_wakeup
+        score -= unfinished * self.p.penalty_unfinished
+
+        return score
+
+    # Итоговые результаты одной репликации
+
+    def results(self) -> dict:
+        lost_total = self.lost_buffer + self.rejected_adaptive
+
+        avg_wait = statistics.mean(self.wait_times) if self.wait_times else 0.0
+        avg_response = statistics.mean(self.response_times) if self.response_times else 0.0
+
+        loss_probability = lost_total / self.arrived if self.arrived else 0.0
+        buffer_loss_probability = self.lost_buffer / self.arrived if self.arrived else 0.0
+        adaptive_reject_probability = self.rejected_adaptive / self.arrived if self.arrived else 0.0
+
+        on_time_probability = self.on_time / self.completed if self.completed else 0.0
+
+        return {
+            "arrived": self.arrived,
+            "accepted": self.accepted,
+            "completed": self.completed,
+            "lost_total": lost_total,
+            "lost_buffer": self.lost_buffer,
+            "rejected_adaptive": self.rejected_adaptive,
+            "unfinished": len(self.queue),
+
+            "loss_probability": loss_probability,
+            "buffer_loss_probability": buffer_loss_probability,
+            "adaptive_reject_probability": adaptive_reject_probability,
+
+            "avg_wait_time": avg_wait,
+            "avg_response_time": avg_response,
+            "on_time_probability": on_time_probability,
+
+            "energy": self.energy,
+            "wakeup_count": self.wakeup_count,
+            "score": self.calculate_score(),
+            "state_time": self.state_time
+        }
+
+
+# ЗАПУСК ОДНОЙ РЕПЛИКАЦИИ
+
+def run_one_replication(params: ModelParams, seed: int) -> dict:
+    env = simpy.Environment()
+    model = AdaptiveMM1rSensorModel(env, params, seed)
+
+    env.process(model.arrival_process())
+    env.run(until=params.replication_time)
+
+    model.finish_energy_count()
+    return model.results()
+
+
+# ЗАПУСК СЕРИИ РЕПЛИКАЦИЙ
+
+def run_replications(params: ModelParams) -> tuple[dict, list[dict]]:
+    all_results = []
+
+    for i in range(params.n_replications):
+        result = run_one_replication(params, seed=params.seed + i)
+        all_results.append(result)
+
+    avg_result = average_results(all_results)
+    avg_result["replications"] = params.n_replications
+    avg_result["replication_time"] = params.replication_time
+
+    return avg_result, all_results
+
+
+def average_results(results: list[dict]) -> dict:
+    numeric_keys = [
+        "arrived",
+        "accepted",
+        "completed",
+        "lost_total",
+        "lost_buffer",
+        "rejected_adaptive",
+        "unfinished",
+        "loss_probability",
+        "buffer_loss_probability",
+        "adaptive_reject_probability",
+        "avg_wait_time",
+        "avg_response_time",
+        "on_time_probability",
+        "energy",
+        "wakeup_count",
+        "score"
+    ]
+
+    avg = {}
+    for key in numeric_keys:
+        avg[key] = statistics.mean(r[key] for r in results)
+
+    avg["state_time"] = {
+        "ACTIVE": statistics.mean(r["state_time"]["ACTIVE"] for r in results),
+        "IDLE": statistics.mean(r["state_time"]["IDLE"] for r in results),
+        "SLEEP": statistics.mean(r["state_time"]["SLEEP"] for r in results),
+        "WAKE": statistics.mean(r["state_time"]["WAKE"] for r in results),
+    }
+
+    return avg
+
+
+# ПЕЧАТЬ РЕЗУЛЬТАТОВ
+
+def print_result(result: dict):
+    print("Результаты моделирования M/M/1/r с отключением сервера и адаптивным потоком")
+    print("=" * 90)
+
+    if "replications" in result:
+        print(f"Количество репликаций: {result['replications']}")
+        print(f"Длительность одной репликации: {result['replication_time']}")
+        print("-" * 90)
+
+    print(f"Поступило событий: {result['arrived']:.2f}")
+    print(f"Принято событий: {result['accepted']:.2f}")
+    print(f"Обработано событий: {result['completed']:.2f}")
+    print(f"Потеряно всего: {result['lost_total']:.2f}")
+    print(f"  - потеряно из-за буфера: {result['lost_buffer']:.2f}")
+    print(f"  - отклонено зависимым потоком (адаптивно): {result['rejected_adaptive']:.2f}")
+    print(f"Осталось в очереди: {result['unfinished']:.2f}")
+
+    print(f"\nВероятность потерь общая: {result['loss_probability']:.4f}")
+    print(f"Вероятность потерь из-за буфера: {result['buffer_loss_probability']:.4f}")
+    print(f"Вероятность адаптивного отказа: {result['adaptive_reject_probability']:.4f}")
+
+    print(f"\nСреднее время ожидания: {result['avg_wait_time']:.2f}")
+    print(f"Среднее время отклика: {result['avg_response_time']:.2f}")
+    print(f"Вероятность обработки в срок: {result['on_time_probability']:.4f}")
+
+    print(f"\nСреднее энергопотребление: {result['energy']:.2f}")
+    print(f"Среднее количество пробуждений: {result['wakeup_count']:.2f}")
+    print(f"Средний итоговый балл системы: {result['score']:.2f}")
+
+    print("\nСреднее время по состояниям сервера:")
+    for state, time_value in result["state_time"].items():
+        print(f"{state}: {time_value:.2f}")
+
+
+# ЭКСПЕРИМЕНТ: ПОДБОР T_SLEEP
+
+def compare_sleep_modes(base_params: ModelParams):
+    variants = [0, 5, 10, 20, 40, 80]
+    best = None
+
+    print("\nСравнение режимов отключения сервера")
+    print("-" * 125)
+    print(
+        "T_sleep | Потери | Адапт. отказ | Буфер. потери | Ср. отклик | "
+        "Энергия | Пробуждения | Балл"
+    )
+    print("-" * 125)
+
+    for i, t_sleep in enumerate(variants):
+        params = ModelParams(**base_params.__dict__)
+        params.t_sleep = t_sleep
+        params.seed = base_params.seed + i * 100
+
+        result, _ = run_replications(params)
+
+        print(
+            f"{t_sleep:7.1f} | "
+            f"{result['loss_probability']:.4f} | "
+            f"{result['adaptive_reject_probability']:.4f} | "
+            f"{result['buffer_loss_probability']:.4f} | "
+            f"{result['avg_response_time']:9.2f} | "
+            f"{result['energy']:8.2f} | "
+            f"{result['wakeup_count']:10.2f} | "
+            f"{result['score']:8.2f}"
+        )
+
+        if best is None or result["score"] > best["result"]["score"]:
+            best = {
+                "t_sleep": t_sleep,
+                "result": result
+            }
+
+    print("-" * 125)
+    print(
+        f"Лучший режим по балльной оценке: "
+        f"T_sleep = {best['t_sleep']}, "
+        f"score = {best['result']['score']:.2f}"
+    )
+
+
+# ЭКСПЕРИМЕНТ: ВЛИЯНИЕ РАЗМЕРА ОЧЕРЕДИ r
+
+def compare_queue_capacity(base_params: ModelParams):
+    variants = [2, 5, 10, 20, 40]
+    best = None
+
+    print("\nСравнение разных размеров очереди")
+    print("-" * 115)
+    print(
+        "r | Потери | Адапт. отказ | Буфер. потери | Ср. отклик | "
+        "Энергия | Балл"
+    )
+    print("-" * 115)
+
+    for i, r_capacity in enumerate(variants):
+        params = ModelParams(**base_params.__dict__)
+        params.r_capacity = r_capacity
+        params.seed = base_params.seed + i * 100
+
+        result, _ = run_replications(params)
+
+        print(
+            f"{r_capacity:2d} | "
+            f"{result['loss_probability']:.4f} | "
+            f"{result['adaptive_reject_probability']:.4f} | "
+            f"{result['buffer_loss_probability']:.4f} | "
+            f"{result['avg_response_time']:9.2f} | "
+            f"{result['energy']:8.2f} | "
+            f"{result['score']:8.2f}"
+        )
+
+        if best is None or result["score"] > best["result"]["score"]:
+            best = {
+                "r_capacity": r_capacity,
+                "result": result
+            }
+
+    print("-" * 115)
+    print(
+        f"Лучший размер очереди по балльной оценке: "
+        f"r = {best['r_capacity']}, "
+        f"score = {best['result']['score']:.2f}"
+    )
+
+def save_sleep_modes_to_csv(base_params: ModelParams, filename="/user/sleep_modes.csv"):
+    variants = [0, 5, 10, 20, 40, 80]
+
+    with open(filename, "w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow([
+            "T_sleep",
+            "loss_probability",
+            "adaptive_reject_probability",
+            "buffer_loss_probability",
+            "avg_response_time",
+            "energy",
+            "wakeup_count",
+            "score"
+        ])
+
+        for i, t_sleep in enumerate(variants):
+            params = ModelParams(**base_params.__dict__)
+            params.t_sleep = t_sleep
+            params.seed = base_params.seed + i * 100
+
+            result, _ = run_replications(params)
+
+            writer.writerow([
+                t_sleep,
+                result["loss_probability"],
+                result["adaptive_reject_probability"],
+                result["buffer_loss_probability"],
+                result["avg_response_time"],
+                result["energy"],
+                result["wakeup_count"],
+                result["score"]
+            ])
+
+
+def save_queue_capacity_to_csv(base_params: ModelParams, filename="/user/queue_capacity.csv"):
+    variants = [2, 5, 10, 20, 40]
+
+    with open(filename, "w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow([
+            "r_capacity",
+            "loss_probability",
+            "adaptive_reject_probability",
+            "buffer_loss_probability",
+            "avg_response_time",
+            "energy",
+            "score"
+        ])
+
+        for i, r_capacity in enumerate(variants):
+            params = ModelParams(**base_params.__dict__)
+            params.r_capacity = r_capacity
+            params.seed = base_params.seed + i * 100
+
+            result, _ = run_replications(params)
+
+            writer.writerow([
+                r_capacity,
+                result["loss_probability"],
+                result["adaptive_reject_probability"],
+                result["buffer_loss_probability"],
+                result["avg_response_time"],
+                result["energy"],
+                result["score"]
+            ])
+
+# ОСНОВНОЙ ЗАПУСК
+
+if __name__ == "__main__":
+    # Здесь менять длительность и количество репликаций
+    params = ModelParams(
+        n_replications=10,
+        replication_time=10_000,
+
+        mtba=8.0,
+        mst=5.0,
+        r_capacity=20,
+
+        buffer_bytes=50_000,
+        avg_event_size=2_000,
+
+        t_sleep=20.0,
+        t_wake=8.0,
+
+        p_active=10.0,
+        p_idle=3.0,
+        p_sleep=0.5,
+        p_wake=8.0,
+
+        d_max=30.0,
+
+        seed=42
+    )
+
+    avg_result, all_results = run_replications(params)
+    print_result(avg_result)
+
+    compare_sleep_modes(params)
+    compare_queue_capacity(params)
+
+    save_sleep_modes_to_csv(params)
+    save_queue_capacity_to_csv(params)
+
+    print("\nCSV-файлы сохранены:")
+    print("/user/sleep_modes.csv")
+    print("/user/queue_capacity.csv")   
