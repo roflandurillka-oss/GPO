@@ -1,0 +1,501 @@
+import csv
+import math
+import random
+import statistics
+from collections import deque
+
+
+# ПАРАМЕТРЫ МОДЕЛИ
+
+SIM_TIME = 1000.0
+DT = 0.5
+N_REPLICATIONS = 5
+
+# G-поток: произвольные интервалы между заявками
+MEAN_INTERARRIVAL = 8.0
+WEIBULL_SHAPE = 1.5
+
+# M-обслуживание: экспоненциальное время обработки
+MEAN_SERVICE = 5.0
+
+QUEUE_CAPACITY = 10
+
+# Надёжность серверов
+MTBF = 250.0
+MTTR = 35.0
+
+# Атаки
+ATTACK_INTERVAL = 250.0
+ATTACK_DURATION = 120.0
+ATTACK_FAIL_MULTIPLIER = 6.0
+
+# Резервирование
+WARM_SWITCH_TIME = 2.0
+COLD_SWITCH_TIME = 20.0
+
+
+# СЕРВЕР
+
+class Server:
+    def __init__(self, name):
+        self.name = name
+
+        self.powered = True
+        self.active = False
+        self.alive = True
+        self.busy = False
+
+        self.job = None
+        self.remaining_service = 0.0
+        self.repair_remaining = 0.0
+
+        self.failures = 0
+        self.attack_failures = 0
+
+        self.busy_time = 0.0
+        self.failed_time = 0.0
+        self.powered_time = 0.0
+        self.active_time = 0.0
+
+
+# МОДЕЛЬ
+class SCADAModel:
+    def __init__(self, mode, attack_enabled, seed):
+        self.mode = mode
+        self.attack_enabled = attack_enabled
+        self.rng = random.Random(seed)
+
+        self.t = 0.0
+        self.queue = deque()
+
+        self.main = Server("Main")
+        self.backup = Server("Backup")
+
+        self.attack_active = False
+        self.attack_remaining = 0.0
+        self.next_attack_time = self.random_attack_interval()
+
+        self.warm_timer = None
+        self.cold_timer = None
+
+        self.generated = 0
+        self.completed = 0
+        self.lost = 0
+        self.interrupted = 0
+
+        self.attacks = 0
+        self.switches = 0
+
+        self.wait_times = []
+        self.system_times = []
+
+        self.max_wait = 0.0
+        self.max_system = 0.0
+
+        self.queue_area = 0.0
+        self.max_queue = 0
+        self.no_active_time = 0.0
+        self.attack_time = 0.0
+
+        self.next_arrival = self.random_interarrival()
+
+        self.configure_initial_state()
+
+    def configure_initial_state(self):
+        if self.mode == "hot":
+            self.main.powered = True
+            self.backup.powered = True
+            self.main.active = True
+            self.backup.active = True
+
+        elif self.mode == "warm":
+            self.main.powered = True
+            self.backup.powered = True
+            self.main.active = True
+            self.backup.active = False
+
+        elif self.mode == "cold":
+            self.main.powered = True
+            self.backup.powered = False
+            self.main.active = True
+            self.backup.active = False
+
+    def random_interarrival(self):
+        scale = MEAN_INTERARRIVAL / math.gamma(1 + 1 / WEIBULL_SHAPE)
+        return self.rng.weibullvariate(scale, WEIBULL_SHAPE)
+
+    def random_service(self):
+        return self.rng.expovariate(1 / MEAN_SERVICE)
+
+    def random_repair(self):
+        return self.rng.expovariate(1 / MTTR)
+
+    def random_attack_interval(self):
+        return self.rng.expovariate(1 / ATTACK_INTERVAL)
+
+    def update_attack(self):
+        if not self.attack_enabled:
+            return
+
+        if self.attack_active:
+            self.attack_remaining -= DT
+            self.attack_time += DT
+
+            if self.attack_remaining <= 0:
+                self.attack_active = False
+                self.next_attack_time = self.t + self.random_attack_interval()
+        else:
+            if self.t >= self.next_attack_time:
+                self.attack_active = True
+                self.attack_remaining = ATTACK_DURATION
+                self.attacks += 1
+
+    def update_reserve_state(self):
+        old_backup_active = self.backup.active
+
+        if self.mode == "hot":
+            self.main.powered = True
+            self.backup.powered = True
+
+            self.main.active = self.main.alive
+            self.backup.active = self.backup.alive
+
+        elif self.mode == "warm":
+            self.main.powered = True
+            self.backup.powered = True
+
+            if self.main.alive:
+                self.main.active = True
+
+                # Если резерв не занят, он уходит обратно в standby.
+                if not self.backup.busy:
+                    self.backup.active = False
+
+                self.warm_timer = None
+            else:
+                self.main.active = False
+
+                if self.backup.alive:
+                    if self.warm_timer is None:
+                        self.warm_timer = WARM_SWITCH_TIME
+
+                    self.warm_timer -= DT
+
+                    if self.warm_timer <= 0:
+                        self.backup.active = True
+                else:
+                    self.backup.active = False
+
+        elif self.mode == "cold":
+            self.main.powered = True
+
+            if self.main.alive:
+                self.main.active = True
+
+                # Если основной восстановился, холодный резерв выключается,
+                # но не прерываем уже начатую обработку.
+                if not self.backup.busy:
+                    self.backup.powered = False
+                    self.backup.active = False
+                    self.backup.alive = True
+                    self.backup.repair_remaining = 0.0
+                    self.cold_timer = None
+            else:
+                self.main.active = False
+                self.backup.powered = True
+
+                if self.backup.alive:
+                    if self.cold_timer is None:
+                        self.cold_timer = COLD_SWITCH_TIME
+
+                    self.cold_timer -= DT
+
+                    if self.cold_timer <= 0:
+                        self.backup.active = True
+                else:
+                    self.backup.active = False
+
+        if (not old_backup_active) and self.backup.active and self.mode != "hot":
+            self.switches += 1
+
+    def fail_server(self, server):
+        server.alive = False
+        server.active = False
+        server.failures += 1
+        server.repair_remaining = self.random_repair()
+
+        if self.attack_active:
+            server.attack_failures += 1
+
+        if server.busy and server.job is not None:
+            self.interrupted += 1
+            self.queue.appendleft(server.job)
+            server.job = None
+            server.busy = False
+            server.remaining_service = 0.0
+
+    def update_failures_and_repairs(self):
+        for server in [self.main, self.backup]:
+            if not server.powered:
+                continue
+
+            if not server.alive:
+                server.repair_remaining -= DT
+                server.failed_time += DT
+
+                if server.repair_remaining <= 0:
+                    server.alive = True
+                    server.repair_remaining = 0.0
+
+                continue
+
+            current_mtbf = MTBF
+
+            if self.attack_active:
+                current_mtbf = MTBF / ATTACK_FAIL_MULTIPLIER
+
+            # В тёплом резерве standby-сервер вне атаки ломается реже.
+            if self.mode == "warm" and server is self.backup and not self.attack_active:
+                current_mtbf = MTBF * 1.5
+
+            fail_probability = DT / current_mtbf
+
+            if self.rng.random() < fail_probability:
+                self.fail_server(server)
+
+    def generate_arrivals(self):
+        while self.t >= self.next_arrival:
+            self.generated += 1
+
+            job = {
+                "arrival_time": self.t
+            }
+
+            if len(self.queue) < QUEUE_CAPACITY:
+                self.queue.append(job)
+                self.max_queue = max(self.max_queue, len(self.queue))
+            else:
+                self.lost += 1
+
+            self.next_arrival += self.random_interarrival()
+
+    def can_process(self, server):
+        return (
+            server.powered
+            and server.alive
+            and server.active
+            and not server.busy
+        )
+
+    def start_jobs(self):
+        for server in [self.main, self.backup]:
+            if len(self.queue) == 0:
+                return
+
+            if self.can_process(server):
+                job = self.queue.popleft()
+
+                wait = self.t - job["arrival_time"]
+                self.wait_times.append(wait)
+                self.max_wait = max(self.max_wait, wait)
+
+                server.busy = True
+                server.job = job
+                server.remaining_service = self.random_service()
+
+    def process_jobs(self):
+        for server in [self.main, self.backup]:
+            if server.busy:
+                server.busy_time += DT
+                server.remaining_service -= DT
+
+                if server.remaining_service <= 0:
+                    self.completed += 1
+
+                    system_time = self.t - server.job["arrival_time"]
+                    self.system_times.append(system_time)
+                    self.max_system = max(self.max_system, system_time)
+
+                    server.busy = False
+                    server.job = None
+                    server.remaining_service = 0.0
+
+    def update_time_statistics(self):
+        self.queue_area += len(self.queue) * DT
+        self.max_queue = max(self.max_queue, len(self.queue))
+
+        active_count = 0
+
+        for server in [self.main, self.backup]:
+            if server.powered:
+                server.powered_time += DT
+
+            if server.powered and server.alive and server.active:
+                active_count += 1
+                server.active_time += DT
+
+        if active_count == 0:
+            self.no_active_time += DT
+
+    def run(self):
+        while self.t < SIM_TIME:
+            self.update_attack()
+            self.update_reserve_state()
+            self.update_failures_and_repairs()
+            self.generate_arrivals()
+            self.process_jobs()
+            self.start_jobs()
+            self.update_time_statistics()
+
+            self.t += DT
+
+        generated_safe = self.generated if self.generated > 0 else 1
+
+        total_failures = self.main.failures + self.backup.failures
+        attack_failures = self.main.attack_failures + self.backup.attack_failures
+
+        avg_wait = statistics.mean(self.wait_times) if self.wait_times else 0.0
+        avg_system = statistics.mean(self.system_times) if self.system_times else 0.0
+
+        return {
+            "mode": self.mode,
+            "attack": "yes" if self.attack_enabled else "no",
+
+            "generated": self.generated,
+            "completed": self.completed,
+            "lost": self.lost,
+            "loss_probability": self.lost / generated_safe,
+
+            "avg_wait": avg_wait,
+            "max_wait": self.max_wait,
+            "avg_system": avg_system,
+            "max_system": self.max_system,
+
+            "avg_queue": self.queue_area / SIM_TIME,
+            "max_queue": self.max_queue,
+
+            "failures": total_failures,
+            "attack_failures": attack_failures,
+            "switches": self.switches,
+            "attacks": self.attacks,
+            "interrupted": self.interrupted,
+
+            "no_active_share": self.no_active_time / SIM_TIME,
+            "attack_share": self.attack_time / SIM_TIME,
+
+            "main_utilization": self.main.busy_time / SIM_TIME,
+            "backup_utilization": self.backup.busy_time / SIM_TIME,
+
+            "main_failed_share": self.main.failed_time / SIM_TIME,
+            "backup_failed_share": self.backup.failed_time / SIM_TIME,
+        }
+
+
+# ЭКСПЕРИМЕНТЫ
+
+def average_rows(rows):
+    result = {}
+
+    for key in rows[0].keys():
+        if isinstance(rows[0][key], (int, float)):
+            result[key] = statistics.mean(row[key] for row in rows)
+        else:
+            result[key] = rows[0][key]
+
+    return result
+
+
+def run_scenario(mode, attack_enabled):
+    rows = []
+
+    for rep in range(N_REPLICATIONS):
+        seed = 1000 + rep
+
+        if mode == "warm":
+            seed += 1000
+        elif mode == "cold":
+            seed += 2000
+
+        if attack_enabled:
+            seed += 5000
+
+        model = SCADAModel(mode, attack_enabled, seed)
+        rows.append(model.run())
+
+    avg = average_rows(rows)
+    avg["n_replications"] = N_REPLICATIONS
+    avg["simulation_time"] = SIM_TIME
+
+    return avg
+
+
+def run_experiments():
+    results = []
+
+    for mode in ["hot", "warm", "cold"]:
+        for attack_enabled in [False, True]:
+            print(f"Запуск: {mode}, attack={attack_enabled}", flush=True)
+            results.append(run_scenario(mode, attack_enabled))
+
+    return results
+
+
+def save_results(rows, filename="/user/scada_reserve_results.csv"):
+    fieldnames = [
+        "mode",
+        "attack",
+        "generated",
+        "completed",
+        "lost",
+        "loss_probability",
+        "avg_wait",
+        "max_wait",
+        "avg_system",
+        "max_system",
+        "avg_queue",
+        "max_queue",
+        "failures",
+        "attack_failures",
+        "switches",
+        "attacks",
+        "interrupted",
+        "no_active_share",
+        "attack_share",
+        "main_utilization",
+        "backup_utilization",
+        "main_failed_share",
+        "backup_failed_share",
+        "n_replications",
+        "simulation_time"
+    ]
+
+    with open(filename, "w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def print_table(rows):
+    print("\n===== РЕЗУЛЬТАТЫ SCADA G/M/2 =====")
+    print("mode | attack | avg_wait | avg_system | failures | switches | no_active %")
+    print("-" * 80)
+
+    for row in rows:
+        print(
+            f"{row['mode']:<5} | "
+            f"{row['attack']:<6} | "
+            f"{row['avg_wait']:>8.3f} | "
+            f"{row['avg_system']:>10.3f} | "
+            f"{row['failures']:>8.2f} | "
+            f"{row['switches']:>8.2f} | "
+            f"{row['no_active_share'] * 100:>10.2f}"
+        )
+
+    print("-" * 80)
+
+
+if __name__ == "__main__":
+    rows = run_experiments()
+    save_results(rows)
+    print_table(rows)
+    print("\nCSV сохранён: /user/scada_reserve_results.csv")
